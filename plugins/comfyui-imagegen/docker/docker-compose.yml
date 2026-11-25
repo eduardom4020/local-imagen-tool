@@ -1,0 +1,29 @@
+# Start:  docker compose up -d        (then open http://127.0.0.1:8188)
+# Stop:   docker compose down          (models stay in the "comfyui-models" volume)
+name: comfyui
+
+services:
+  comfyui:
+    build: .
+    image: local/comfyui:latest
+    container_name: comfyui
+    ports:
+      - "127.0.0.1:8188:8188"          # only reachable from this PC
+    volumes:
+      - comfyui-models:/opt/ComfyUI/models              # fast Linux volume for big model files
+      - comfyui-custom-nodes:/opt/ComfyUI/custom_nodes
+      - ./output:/opt/ComfyUI/output                    # generated images, visible in Windows
+      - ./input:/opt/ComfyUI/input
+      - ./user:/opt/ComfyUI/user                        # saved workflows and settings
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+volumes:
+  comfyui-models:
+  comfyui-custom-nodes:

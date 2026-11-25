@@ -1,0 +1,17 @@
+{
+  "name": "comfyui-imagegen-market",
+  "owner": {
+    "name": "Eduardo Braga"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for local image generation."
+  },
+  "plugins": [
+    {
+      "name": "comfyui-imagegen",
+      "source": "./plugins/comfyui-imagegen",
+      "description": "Local AI image generation: ComfyUI (Docker) + FLUX.2 klein 4B, detachable references, named styles, private best-of-N picking.",
+      "version": "1.0.0"
+    }
+  ]
+}
