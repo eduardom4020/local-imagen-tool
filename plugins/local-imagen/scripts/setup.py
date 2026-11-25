@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Set up the comfyui-imagegen plugin on this machine (standard library only; Windows, Linux, macOS).
+"""Set up the local-imagen plugin on this machine (standard library only; Windows, Linux, macOS).
 
   python setup.py --check                  check prerequisites only (GPU, Docker + GPU access, uv)
   python setup.py                          full setup: config, Docker image, FLUX.2 klein model, start + verify
   python setup.py --models core extras     also download the comparison models (~26 GB more)
   python setup.py --external-url URL       use an existing ComfyUI instead of Docker (no build/start)
-  python setup.py --home PATH              data folder (default ~/.comfyui-mcp)
+  python setup.py --home PATH              data folder (default ~/.local-imagen)
 
-Writes ~/.comfyui-mcp/config.json (read by the MCP server). Safe to re-run: finished steps are skipped.
+Writes ~/.local-imagen/config.json (read by the MCP server). Safe to re-run: finished steps are skipped.
 """
 import argparse
 import json
@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1]
-CFG_DIR = Path.home() / ".comfyui-mcp"
+CFG_DIR = Path.home() / ".local-imagen"
 CFG_FILE = CFG_DIR / "config.json"
 COMPOSE_PROJECT = "comfyui"
 MODELS_VOLUME = f"{COMPOSE_PROJECT}_comfyui-models"
@@ -148,7 +148,7 @@ def verify_models(url):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="only check prerequisites")
-    ap.add_argument("--home", help="data folder (default: keep current, else ~/.comfyui-mcp)")
+    ap.add_argument("--home", help="data folder (default: keep current, else ~/.local-imagen)")
     ap.add_argument("--docker-dir", help="where to put docker-compose.yml (default <home>/docker)")
     ap.add_argument("--external-url", help="use an existing ComfyUI at this URL instead of Docker")
     ap.add_argument("--models", nargs="+", default=["core"], choices=["core", "extras"])
@@ -164,7 +164,7 @@ def main():
         write_config({"home": args.home, "comfyui_url": url, "manage_docker": False})
         wait_for_comfyui(url, 30)
         verify_models(url)
-        print("\nSETUP OK (external ComfyUI). Restart Claude Code so the comfyui tools load.")
+        print("\nSETUP OK (external ComfyUI). Restart Claude Code so the image tools load.")
         return
     step("Checking Docker GPU access")
     docker_ok = check_docker_gpu()
@@ -213,7 +213,7 @@ def main():
     verify_models(url)
     run(["docker", "compose", "stop"], cwd=docker_dir, quiet=True)
     print("\nSETUP OK. ComfyUI is installed and stopped; the MCP server starts it on demand.\n"
-          "Restart Claude Code (or run /reload-plugins) so the comfyui tools and the image-picker agent load.")
+          "Restart Claude Code (or run /reload-plugins) so the image tools and the image-picker agent load.")
 
 
 if __name__ == "__main__":

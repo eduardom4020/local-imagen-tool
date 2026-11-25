@@ -1,12 +1,12 @@
 ---
-name: comfyui-imagegen-setup
-description: Install, set up, verify or repair the comfyui-imagegen plugin (local ComfyUI in Docker + FLUX.2 klein 4B + the comfyui MCP tools + the image-picker agent) on this machine. Use when the user says "set up / install the image generator", "set up comfyui", "make the image tools work on this PC", after installing the comfyui-imagegen plugin, or when comfyui tools fail because ComfyUI, Docker or the model is missing.
+name: local-imagen-setup
+description: Install, set up, verify or repair the local-imagen plugin (local ComfyUI in Docker + FLUX.2 klein 4B + the imagen MCP tools + the image-picker agent) on this machine. Use when the user says "set up / install the image generator", "set up comfyui", "make the image tools work on this PC", after installing the local-imagen plugin, or when the image tools fail because ComfyUI, Docker or the model is missing.
 ---
 
-# Set up comfyui-imagegen on this machine
+# Set up local-imagen on this machine
 
 The plugin root is two folders above this skill's directory (`<root>/scripts/setup.py`, `<root>/docker/`).
-Everything machine-specific lives in `~/.comfyui-mcp/` (config.json, data); the plugin itself holds no data.
+Everything machine-specific lives in `~/.local-imagen/` (config.json, data); the plugin itself holds no data.
 
 ## What it needs
 - An NVIDIA GPU with 8 GB+ and a current driver (`nvidia-smi` works).
@@ -25,8 +25,8 @@ Installing Docker, drivers or uv changes the system: ask the user before doing i
    `--external-url http://host:8188` to use an existing ComfyUI (then put `flux-2-klein-4b.safetensors`,
    `qwen_3_4b_fp4_flux2.safetensors` and `flux2-vae.safetensors` from Comfy-Org/Flux-2-Klein-4B in its
    diffusion_models / text_encoders / vae folders).
-3. Ask the user to restart Claude Code (or run `/reload-plugins`) so the comfyui tools load.
-4. Verify: call `comfyui_status`, then delegate a small test image to the image-picker agent and show only its pick.
+3. Ask the user to restart Claude Code (or run `/reload-plugins`) so the image tools load.
+4. Verify: call `backend_status`, then delegate a small test image to the image-picker agent and show only its pick.
 
 ## Using it (for reference)
 Every image request goes to the image-picker agent; show the user only the picked image with one or two short lines.
@@ -41,4 +41,4 @@ replies with one short line saying the image session is still up and they can as
 | `docker compose` not found from the MCP | Docker Desktop's CLI plugins missing from PATH; reinstall Docker Desktop or add its `resources\bin`. |
 | WSL/Docker killed during model load (Windows) | Raise `memory=` in `%USERPROFILE%\.wslconfig` (16 GB+), then `wsl --shutdown`. Ask first. |
 | Port 8188 busy | Another ComfyUI is running: use it with `--external-url`, or stop it. |
-| Tools missing in a session | Restart Claude Code; meanwhile the agent can use the bridge in `~/.comfyui-mcp/bridge.json`. |
+| Tools missing in a session | Restart Claude Code; meanwhile the agent can use the bridge in `~/.local-imagen/bridge.json`. |

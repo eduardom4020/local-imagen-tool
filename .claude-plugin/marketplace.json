@@ -1,5 +1,5 @@
 {
-  "name": "comfyui-imagegen-market",
+  "name": "local-imagen-tool",
   "owner": {
     "name": "Eduardo Braga"
   },
@@ -8,8 +8,8 @@
   },
   "plugins": [
     {
-      "name": "comfyui-imagegen",
-      "source": "./plugins/comfyui-imagegen",
+      "name": "local-imagen",
+      "source": "./plugins/local-imagen",
       "description": "Local AI image generation: ComfyUI (Docker) + FLUX.2 klein 4B, detachable references, named styles, private best-of-N picking.",
       "version": "1.0.0"
     }

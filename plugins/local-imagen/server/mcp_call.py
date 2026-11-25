@@ -2,10 +2,10 @@
 # requires-python = ">=3.10"
 # dependencies = ["mcp>=2.3,<3", "httpx>=0.27", "pillow>=10"]
 # ///
-"""Call one tool of the comfyui MCP server over stdio, for sessions where its tools aren't loaded.
+"""Call one tool of the local-imagen MCP server over stdio, for sessions where its tools aren't loaded.
 
 Usage: uv run --script mcp_call.py <tool_name> '<json arguments>'
-   or: "<python from ~/.comfyui-mcp/bridge.json>" mcp_call.py <tool_name> '<json arguments>'
+   or: "<python from ~/.local-imagen/bridge.json>" mcp_call.py <tool_name> '<json arguments>'
 Prints the text result; returned images are saved under <home>/previews/ and their paths printed.
 """
 import asyncio
@@ -23,13 +23,13 @@ HERE = Path(__file__).resolve().parent
 
 
 def previews_dir() -> Path:
-    home = os.environ.get("COMFYUI_MCP_HOME")
+    home = os.environ.get("LOCAL_IMAGEN_HOME")
     if not home:
         try:
-            home = json.loads((Path.home() / ".comfyui-mcp" / "config.json").read_text(encoding="utf-8")).get("home")
+            home = json.loads((Path.home() / ".local-imagen" / "config.json").read_text(encoding="utf-8")).get("home")
         except (FileNotFoundError, json.JSONDecodeError):
             home = None
-    d = Path(home or Path.home() / ".comfyui-mcp").expanduser() / "previews"
+    d = Path(home or Path.home() / ".local-imagen").expanduser() / "previews"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

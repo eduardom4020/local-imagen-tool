@@ -3,18 +3,18 @@
 # dependencies = ["mcp>=2.3,<3", "httpx>=0.27", "pillow>=10"]
 # ///
 """ComfyUI image-generation MCP server (FLUX.2 klein 4B) with detachable reference images, named styles and a
-candidate -> pick -> approve workflow. Part of the comfyui-imagegen Claude Code plugin.
+candidate -> pick -> approve workflow. Part of the local-imagen Claude Code plugin.
 
 Run by Claude Code over stdio:  uv run --script server.py   (uv installs the dependencies above)
 
-Settings (environment variable > ~/.comfyui-mcp/config.json key > default):
-  COMFYUI_MCP_HOME   / home            data folder (library/, outputs/, temp/, styles.json, state.json)
-                                       default ~/.comfyui-mcp
+Settings (environment variable > ~/.local-imagen/config.json key > default):
+  LOCAL_IMAGEN_HOME   / home            data folder (library/, outputs/, temp/, styles.json, state.json)
+                                       default ~/.local-imagen
   COMFYUI_URL        / comfyui_url     default http://127.0.0.1:8188
   COMFYUI_DOCKER_DIR / docker_dir      folder with docker-compose.yml, default <home>/docker
   COMFYUI_MANAGE_DOCKER / manage_docker  false when ComfyUI is run some other way (no start/stop)
   OLLAMA_URL         / ollama_url      default http://127.0.0.1:11434 (models are unloaded to free the GPU)
-  COMFYUI_CANDIDATES / candidates      candidates per request, default 3
+  LOCAL_IMAGEN_CANDIDATES / candidates      candidates per request, default 3
   model                                {"unet": ..., "text_encoder": ..., "vae": ...} file names override
 """
 from __future__ import annotations
@@ -42,7 +42,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------- config
-CFG_DIR = Path.home() / ".comfyui-mcp"
+CFG_DIR = Path.home() / ".local-imagen"
 try:
     CFG = json.loads((CFG_DIR / "config.json").read_text(encoding="utf-8"))
 except (FileNotFoundError, json.JSONDecodeError):
@@ -54,7 +54,7 @@ def setting(key: str, env: str | None, default):
     return v if v not in (None, "") else CFG.get(key, default)
 
 
-HOME = Path(setting("home", "COMFYUI_MCP_HOME", CFG_DIR)).expanduser()
+HOME = Path(setting("home", "LOCAL_IMAGEN_HOME", CFG_DIR)).expanduser()
 COMFY = str(setting("comfyui_url", "COMFYUI_URL", "http://127.0.0.1:8188")).rstrip("/")
 OLLAMA = str(setting("ollama_url", "OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
 DOCKER_DIR = Path(setting("docker_dir", "COMFYUI_DOCKER_DIR", HOME / "docker")).expanduser()
@@ -69,7 +69,7 @@ CAND = TEMP / "candidates"   # all candidates of open requests (hidden from the 
 SEL = TEMP / "selected"      # the picked candidate of each open request, waiting for the user's approval
 for d in (LIB, OUT, CAND, SEL):
     d.mkdir(parents=True, exist_ok=True)
-DEFAULT_CANDIDATES = int(setting("candidates", "COMFYUI_CANDIDATES", 3))
+DEFAULT_CANDIDATES = int(setting("candidates", "LOCAL_IMAGEN_CANDIDATES", 3))
 MAX_CANDIDATES = 8
 
 MODEL = {  # FLUX.2 klein 4B (distilled, Apache 2.0)
@@ -259,7 +259,7 @@ async def _ollama_restore() -> list[str]:
 async def free_gpu_from_ollama(notes: list):
     unloaded = await _ollama_unload()
     if unloaded:
-        notes.append("unloaded Ollama models from the GPU (stop_comfyui reloads them): " + ", ".join(unloaded))
+        notes.append("unloaded Ollama models from the GPU (stop_backend reloads them): " + ", ".join(unloaded))
 
 
 async def ensure_comfyui(free_gpu=True) -> str:
@@ -275,7 +275,7 @@ async def _start_container(notes: list):
     if not MANAGE_DOCKER:
         raise RuntimeError(f"ComfyUI is not answering at {COMFY} and manage_docker is off: start ComfyUI yourself")
     if not (DOCKER_DIR / "docker-compose.yml").exists():
-        raise RuntimeError(f"no docker-compose.yml in {DOCKER_DIR}: run the comfyui-imagegen-setup skill first")
+        raise RuntimeError(f"no docker-compose.yml in {DOCKER_DIR}: run the local-imagen-setup skill first")
     if not await asyncio.to_thread(_docker_ready):
         if sys.platform == "win32" and DOCKER_DESKTOP.exists():
             subprocess.Popen([str(DOCKER_DESKTOP)], env=_env(),
@@ -373,7 +373,7 @@ async def run_workflow(c: httpx.AsyncClient, wf: dict, timeout=900) -> bytes:
 
 # ---------------------------------------------------------------- MCP server + tools
 mcp = MCPServer(
-    "comfyui",
+    "local-imagen",
     instructions=(
         "Local image generation (ComfyUI, FLUX.2 klein 4B, ~9 s/image, ~16 s with references) on the user's "
         "RTX 4060. By default generate_image is plain text-to-image with NO references. Reference images are "
@@ -383,7 +383,7 @@ mcp = MCPServer(
         "CANDIDATE WORKFLOW: every generate_image call renders N candidates (default 3, set_candidate_count) "
         "and the best one is chosen with pick_candidate. Candidate images must never reach the user's chat: in "
         "the main conversation, do NOT call generate_image yourself - delegate each request to the "
-        "'image-picker' subagent (listed as comfyui-imagegen:image-picker when installed as a plugin), which "
+        "'image-picker' subagent (listed as local-imagen:image-picker when installed as a plugin), which "
         "generates, judges privately and returns only the picked file. (If you "
         "ARE the image-picker, generate and pick yourself.) Then show the user only the picked image by reading "
         "temp/selected/<request>.png, with at most one or two short lines. Use show_candidates only when the "
@@ -619,7 +619,7 @@ async def clear_session(stop: bool = True) -> str:
     _save(STATE_FILE, st)
     msg = f"Session cleared: {n_open} unapproved request(s) discarded, references detached, {DEFAULT_CANDIDATES} candidates per request."
     if stop:
-        msg += " " + await stop_comfyui(restore_ollama=True)
+        msg += " " + await stop_backend(restore_ollama=True)
     return msg
 
 
@@ -736,7 +736,7 @@ async def delete_style(name: str) -> str:
 
 
 @tool
-async def comfyui_status() -> str:
+async def backend_status() -> str:
     """Show whether ComfyUI is up, GPU memory, attached references and Ollama models holding the GPU."""
     lines = []
     if await comfy_up():
@@ -746,7 +746,7 @@ async def comfyui_status() -> str:
         lines.append(f"ComfyUI {ss['system'].get('comfyui_version')} up at {COMFY}; "
                      f"GPU free {dev['vram_free'] / 2**30:.1f} / {dev['vram_total'] / 2**30:.1f} GB")
     else:
-        lines.append("ComfyUI is not running (generate_image or start_comfyui will start it).")
+        lines.append("ComfyUI is not running (generate_image or start_backend will start it).")
     try:
         async with httpx.AsyncClient(timeout=5) as c:
             models = (await c.get(f"{OLLAMA}/api/ps")).json().get("models", [])
@@ -758,15 +758,15 @@ async def comfyui_status() -> str:
 
 
 @tool
-async def start_comfyui(free_gpu: bool = True) -> str:
+async def start_backend(free_gpu: bool = True) -> str:
     """Start Docker Desktop (if needed) and the ComfyUI container. free_gpu unloads Ollama models from the GPU
-    (they are reloaded by stop_comfyui)."""
+    (they are reloaded by stop_backend)."""
     return await ensure_comfyui(free_gpu)
 
 
 @tool
-async def stop_comfyui(restore_ollama: bool = True) -> str:
-    """Stop the ComfyUI container (models stay installed) and reload any Ollama models start_comfyui unloaded."""
+async def stop_backend(restore_ollama: bool = True) -> str:
+    """Stop the ComfyUI container (models stay installed) and reload any Ollama models start_backend unloaded."""
     if await comfy_up():
         try:
             async with httpx.AsyncClient(timeout=30) as c:

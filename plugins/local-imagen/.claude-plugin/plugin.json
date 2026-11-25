@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
-  "name": "comfyui-imagegen",
+  "name": "local-imagen",
   "version": "1.0.0",
   "description": "Local AI image generation for Claude: ComfyUI in Docker + FLUX.2 klein 4B, detachable reference images and named styles, and a private candidate picker (image-picker agent) that shows you only the best image.",
   "author": {
