@@ -12,7 +12,7 @@ services:
     volumes:
       - comfyui-models:/opt/ComfyUI/models              # fast Linux volume for big model files
       - comfyui-custom-nodes:/opt/ComfyUI/custom_nodes
-      - ./output:/opt/ComfyUI/output                    # generated images, visible in Windows
+      - ./output:/opt/ComfyUI/output                    # generated images, visible on the host
       - ./input:/opt/ComfyUI/input
       - ./user:/opt/ComfyUI/user                        # saved workflows and settings
     deploy:

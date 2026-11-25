@@ -10,8 +10,8 @@
     {
       "name": "local-imagen",
       "source": "./plugins/local-imagen",
-      "description": "Local AI image generation: ComfyUI (Docker) + FLUX.2 klein 4B, detachable references, named styles, private best-of-N picking.",
-      "version": "1.0.0"
+      "description": "Local AI image generation: ComfyUI (Docker) + FLUX.2 klein 4B, game projects with a chat-managed style guide (characters, locations, styles, cameras...), isolated sessions, private best-of-N picking.",
+      "version": "1.1.0"
     }
   ]
 }

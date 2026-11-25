@@ -1,3 +1,26 @@
 __pycache__/
 *.pyc
 .venv/
+
+# user data never belongs in this repo (it lives in ~/.local-imagen and the projects folder)
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.safetensors
+outputs/
+output/
+input/
+library/
+sessions/
+previews/
+temp/
+locks/
+local-imagen-projects/
+styles.json
+state.json
+backend.json
+projects.json
+bridge.json
+config.json
+*.tmp

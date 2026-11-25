@@ -11,6 +11,7 @@ Writes ~/.local-imagen/config.json (read by the MCP server). Safe to re-run: fin
 """
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -61,8 +62,9 @@ def docker_ready():
 def ensure_docker():
     if docker_ready():
         return True
-    desktop = Path(r"C:\Program Files\Docker\Docker\Docker Desktop.exe")
-    if sys.platform == "win32" and desktop.exists():
+    pf = os.environ.get("ProgramFiles") if sys.platform == "win32" else None  # from the OS, never hardcoded
+    desktop = Path(pf) / "Docker" / "Docker" / "Docker Desktop.exe" if pf else None
+    if desktop and desktop.exists():
         subprocess.Popen([str(desktop)])
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-a", "Docker"])
