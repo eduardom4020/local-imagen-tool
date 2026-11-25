@@ -674,6 +674,8 @@ def _primary_ref(e: dict) -> dict | None:
 
 def _entry_text(e: dict, full: bool = True) -> str:
     lines = [f"{e['name']} ({_eid(e)})", f"  description: {e.get('description') or '(none yet)'}"]
+    if e.get("concept"):
+        lines.append("  concept (steers pose/expression/action; never sent to the model): " + e["concept"])
     if e.get("must_have"):
         lines.append("  must show: " + "; ".join(e["must_have"]))
     if e.get("never"):
@@ -720,6 +722,8 @@ def _write_guide_md(proj: Path, info: dict | None = None):
         lines += [f"## {GUIDE_TITLES.get(k, k.replace('-', ' ').title())}", ""]
         for e in groups[k]:
             lines += [f"### {e['name']}", "", e.get("description") or "_(no description yet)_", ""]
+            if e.get("concept"):
+                lines += [f"**Concept:** {e['concept']}", ""]
             for label, key in (("Must show", "must_have"), ("Never", "never"), ("Tags", "tags")):
                 if e.get(key):
                     lines.append(f"- **{label}:** " + ("; " if key != "tags" else ", ").join(e[key]))
@@ -1078,9 +1082,14 @@ mcp = MCPServer(
         "own image session, so parallel sessions never share working state.\n\n"
         "STYLE GUIDE: MANAGED BY CHAT. Entries have a kind (style, character, creature, location, prop, pose, "
         "camera, or another single word), a fixed description (the exact wording put into every prompt that uses "
-        "the entry), must_have / never checklists, tags, notes and reference images. Read with guide_list / "
-        "guide_show before editing; write only what the user said or approved (ask rather than invent). Keep "
-        "descriptions short and visual. set_project_info(default_style=...) applies a style entry to every image. "
+        "the entry), an optional concept, must_have / never checklists, tags, notes and reference images. Read "
+        "with guide_list / guide_show before editing; write only what the user said or approved (ask rather than "
+        "invent). Keep descriptions short and visual. The concept is who the character, creature or place is: "
+        "personality, how they move and fight, mood, what their symbols mean. It is never sent to the image model "
+        "(a text-to-image model takes words literally, so story text turns into stray objects); the image-picker "
+        "reads it to choose poses, expressions, actions and mood that fit. Put story and meaning in concept, "
+        "looks in description, and design history in notes. "
+        "set_project_info(default_style=...) applies a style entry to every image. "
         "Approved images are filed in the project's outputs; approve_image(reference_for=[...]) or "
         "guide_add_reference(<image path>) turns them into references.\n\n"
         "CANDIDATE WORKFLOW. Every generate_image call renders N candidates (default 3, set_candidate_count) and "
@@ -1382,7 +1391,7 @@ async def guide_list(kind: str = "") -> str:
     lines = [f"Guide of '{info['name']}' (default style: {info.get('default_style') or 'none'}):"]
     for e in entries:
         lines.append(f"- {e['name']} ({_eid(e)}): {(e.get('description') or '(no description)')[:120]} "
-                     f"[{len(e.get('refs') or [])} ref(s)]")
+                     f"[{len(e.get('refs') or [])} ref(s){', has concept' if e.get('concept') else ''}]")
     return "\n".join(lines)
 
 
@@ -1400,14 +1409,18 @@ async def guide_show(name: str, show_images: bool = True) -> list:
 @tool
 async def guide_set(name: str, kind: str = "", description: str | None = None, must_have: list[str] | None = None,
                     never: list[str] | None = None, tags: list[str] | None = None, notes: str | None = None,
-                    rename_to: str = "") -> str:
+                    concept: str | None = None, rename_to: str = "") -> str:
     """Create or update a guide entry of the open project. Only the fields you pass change; lists you pass replace
     the old list (read the entry with guide_show first to keep existing items).
 
     kind: needed for a new entry: style, character, creature, location, prop, pose, camera, or another word.
     description: the fixed visual description used word for word in every prompt with this entry.
+    concept: who the entry is: personality, how they move and fight, mood, meaning of their symbols, story role.
+             Never sent to the image model; the image-picker reads it to choose fitting poses, expressions and
+             actions. "" clears it.
     must_have: details every image must show (checked when picking). never: things that must not appear.
-    tags / notes: for organising; not sent to the model. rename_to: new display name (folder renamed too).
+    tags / notes: for organising (e.g. design history); not sent to the model. rename_to: new display name
+    (folder renamed too).
     """
     proj, info = current()
     created = False
@@ -1423,8 +1436,8 @@ async def guide_set(name: str, kind: str = "", description: str | None = None, m
             if not kind.strip():
                 raise ValueError("this is a new entry: give its kind (" + ", ".join(KNOWN_KINDS) + ", or another word)")
             k, s = slugify(kind), slugify(name)
-            e = {"name": name.strip(), "slug": s, "kind": k, "description": "", "must_have": [], "never": [],
-                 "tags": [], "notes": "", "refs": [], "examples": [], "created": now_iso(),
+            e = {"name": name.strip(), "slug": s, "kind": k, "description": "", "concept": "", "must_have": [],
+                 "never": [], "tags": [], "notes": "", "refs": [], "examples": [], "created": now_iso(),
                  "_dir": proj / "guide" / k / s}
             created = True
         if description is not None:
@@ -1434,6 +1447,8 @@ async def guide_set(name: str, kind: str = "", description: str | None = None, m
                 e[key] = [x.strip() for x in val if x and x.strip()]
         if notes is not None:
             e["notes"] = notes.strip()
+        if concept is not None:
+            e["concept"] = concept.strip()
         if rename_to.strip() and rename_to.strip() != e["name"]:
             ns = slugify(rename_to)
             nd = proj / "guide" / e["kind"] / ns
@@ -1523,7 +1538,8 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     pick_candidate with the best one; only the picked image is presented to the user.
 
     prompt: the scene: action, pose, composition, background. Don't restate guide entries; their fixed
-            descriptions are added automatically.
+            descriptions are added automatically. Entry concepts are NOT added: read them (guide_show) and turn
+            them into visible pose, expression and action here, never into story words or symbols.
     entries: guide entry names (or kind/name) in the image, e.g. ["Aldric", "Frost Keep", "tactics camera"]. The
              project's default style is added unless use_default_style=False or a style entry is listed.
     project: the project the request is for (or 'scratch'). It must match this session's project; if the session

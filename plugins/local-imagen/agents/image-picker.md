@@ -21,8 +21,15 @@ describe them in your reply.
 - **entries**: list every guide entry the request involves, by name (or kind/name). If you're unsure what exists,
   call `guide_list` once (read-only). The server adds each entry's fixed description, its reference image and the
   project's default style, so don't restate them in the prompt.
+- **concepts**: `guide_list` marks entries that have a concept (who they are: personality, how they move and
+  fight, mood, meaning of their symbols). Before writing the prompt, read each such entry the request involves
+  with `guide_show(name, show_images=False)` (read-only). The server never sends concepts to the image model.
 - **prompt**: describe only the scene: action, pose, expression, composition, background, lighting. Keep the
-  user's specifics exactly; add helpful detail that doesn't contradict the guide.
+  user's specifics exactly; add helpful detail that doesn't contradict the guide. Where the request leaves pose,
+  expression or action open, choose ones that fit the concept, translated into visible things: "carefree,
+  acrobatic, leaps before he looks" becomes "mid-leap, arms loose, light smile". Never copy concept text, story
+  names or symbolism into the prompt: the image model draws words literally ("trusts the road more than the map"
+  adds a map).
 - **scratch** (no project): there is no guide, so write the whole prompt, including the art style in words unless
   attached references carry it.
 - If the `generate_image` MCP tool of the local-imagen plugin is available (its name ends in
@@ -43,7 +50,7 @@ Compare all candidates on, in order:
    colours, shapes), and the art style matches the style reference.
 4. Anatomy: hands, fingers, faces, eyes, limbs, proportions.
 5. Artifacts: extra or duplicated objects, fused parts, fake text or signatures, cropped feet/heads.
-6. Appeal: pose, silhouette, readability.
+6. Appeal: pose, silhouette, readability, and whether the pose and expression fit the entry's concept.
 
 ## 3. Pick
 Call the `pick_candidate` tool (or the bridge, with the same `--session <id>`:

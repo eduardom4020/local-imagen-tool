@@ -41,6 +41,9 @@ project.
 - "List my projects." / "New project *Ember Tactics*, put it in my game repo's `art` folder."
 - "Add a character *Aldric*: young knight, short silver hair, blue tabard; he always has a scar on his left cheek
   and never wears a helmet." / "Use this image as Aldric's reference."
+- "Aldric's concept: proud and stubborn, fights defensively behind his shield, the scar is from his first
+  duel." Concepts are never sent to the image model: the picker uses them to choose poses and expressions
+  that fit (a text-to-image model would draw story words literally).
 - "Add a style *watercolor* with these images and make it the default." / "Add a camera *tactics*: isometric 3/4
   view from above."
 - "Draw Aldric guarding the gate of Frost Keep, tactics camera."
@@ -61,7 +64,7 @@ no Documents folder, they go to `<home>/projects`. You can:
 <project>/
   project.json                 name, description, default style
   GUIDE.md                     readable overview of the guide (regenerated on every change)
-  guide/<kind>/<entry>/        entry.json (description, must_have, never, tags, notes, refs, examples) + refs/*.png
+  guide/<kind>/<entry>/        entry.json (description, concept, must_have, never, tags, notes, refs, examples) + refs/*.png
   outputs/<date>/              approved images, each with a JSON file (prompt, seed, entries, references)
 ```
 
