@@ -32,6 +32,39 @@ describe them in your reply.
   adds a map).
 - **scratch** (no project): there is no guide, so write the whole prompt, including the art style in words unless
   attached references carry it.
+- **pose guide** for action, combat or acrobatic poses (jumps, flips, slides, landings, sword strikes, crouches,
+  anything with crossed or foreshortened limbs). Use it also when the request asks for one or names a guide pose
+  entry. Steps:
+  1. Call `render_pose` (read-only for the guide). Start from the closest preset and override joints
+     (`{"preset": "land", "right_arm": {...}}`). Settings:
+     - `heads`: the character's proportions from their guide entry (e.g. "about 7 heads"), default 7.
+     - `aspect`: the same as the image.
+     - the camera: the action presets (aerial_slash, dash_strike, leap_strike, rising_slash, hero_landing,
+       backflip, iai_draw, flying_kick, dodge_back, reverse_guard) come with a dramatic camera of their own.
+       Leave `view` unset to use it, and use `facing` only to pick the side.
+       - Otherwise set `view` / `facing` / `elevation` (negative = low heroic angle) / `distance` (2.5-3 =
+         strong perspective).
+       - Keep the main limb (sword arm, kicking leg) broadside to the camera: a limb pointing at the lens reads
+         poorly.
+     - a `sword` prop if they hold one. Use `"two_handed": true` for a two-handed grip; the other arm is placed
+       on the hilt automatically, and a WARNING means it couldn't reach. For a sheathed sword, leave the prop out
+       and mention the sheath in the prompt.
+     - `mirror=True` makes the pose left-handed. Don't use it for a right-handed character.
+  2. Look at the render. Check:
+     - each limb's length and direction;
+     - no limbs merging;
+     - the hands and the sword angle;
+     - balance: feet on the ground, or clearly airborne.
+
+     `color_sides=True` tints the figure's left blue and right warm, to check sides; don't use that render for
+     generation. Fix and render again, at most 3 tries.
+  3. Pass the final mannequin path as `generate_image(pose=<path>)`, with the character entries as usual. The
+     server sends the mannequin as the pose and crops full-length character/style references to head and chest,
+     so they don't override the pose.
+  4. In the prompt, describe the action in words too, and keep the mannequin out of it (don't write "mannequin"
+     or "grey"). Judge anatomy against the mannequin.
+  5. If `render_pose` says Blender isn't set up, generate without a pose guide and add `pose renderer not set up
+     (setup_blender)` to your note.
 - If the `generate_image` MCP tool of the local-imagen plugin is available (its name ends in
   `imagen__generate_image`), call it with the default candidate count. Its result contains every candidate preview
   plus a **checklist**.

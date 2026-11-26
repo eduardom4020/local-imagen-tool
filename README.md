@@ -13,6 +13,9 @@ A Claude Code plugin that gives Claude its own image generator, running on your 
   project. You can ask to see the candidates.
 - **Isolated sessions**: every Claude session has its own image session. Switching projects carries nothing over,
   and two sessions can work at the same time, even on the same project.
+- **Pose guides**: Blender draws a grey mannequin in the exact pose and camera angle. The picker uses it for
+  action and acrobatic shots, so limbs stay in the right place. The pose comes from presets or joint angles, and
+  you can save poses to the guide.
 - **Setup skill + script**: builds ComfyUI, downloads the model and checks that everything works on a new machine.
 
 ## Install (any machine)
@@ -27,8 +30,8 @@ claude plugin install local-imagen@local-imagen-tool
 ```
 
 Then start Claude Code and say **"set up the local image generator"**. The setup skill checks the prerequisites
-and runs `plugins/local-imagen/scripts/setup.py`, which builds the image and downloads the model (15-30 min
-the first time). Restart Claude Code when it finishes.
+and runs `plugins/local-imagen/scripts/setup.py`. It builds the image, downloads the model and builds the
+Blender pose-renderer image (15-30 min the first time). Restart Claude Code when it finishes.
 
 To use a ComfyUI you already run, use `setup.py --external-url http://host:8188` (no Docker needed).
 
@@ -81,6 +84,50 @@ All paths inside a project are relative, so a project folder works on any OS and
 - ComfyUI is stopped only when no other session is still using it. The Ollama models it unloaded are reloaded
   at that point.
 
+## Pose guides (Blender)
+
+Image models easily mix up limbs in action poses: crossed legs, doubled hands, odd arm angles. A pose guide
+fixes most of that. `render_pose` uses Blender to draw a plain grey artist's mannequin in the pose you want, at
+the camera angle you want. `generate_image(pose=...)` then sends it as the pose reference. Every full-length
+character, creature or style reference is cut down to head and chest at the same time, because FLUX.2 klein
+copies the pose of any full-body figure it is shown.
+
+- **Presets:** stand, idle, walk, run, jump, leap, crouch, kneel, sit, sit_ground, lunge, guard, slash, overhead,
+  flip, slide, land, wave, lie.
+- **Action presets with their own dramatic camera:** aerial_slash, dash_strike, leap_strike (two-handed),
+  rising_slash, hero_landing (sword planted), backflip, iai_draw, flying_kick, dodge_back, reverse_guard.
+- **Adjusting:** any joint can be changed with readable angles: spine bend/twist, head nod/turn, arm and leg
+  `aim` (forward / up / out), elbow and knee bend, wrist.
+- **Sword:** held normally or in a reverse grip, one-handed or two-handed. For two hands, the second arm is
+  placed on the hilt automatically.
+- **Left-handed versions:** `mirror` flips any pose.
+- **Figure:** proportions are set in heads (`heads=7`), plus build, shoulders and hips.
+- **Camera:** views are front, three-quarter, side and back. The figure faces left or right, and camera height
+  and perspective can be changed.
+- **Outputs:** a depth map on request, and the 2D joint positions in a JSON file.
+- **Keeping poses:** "Save this pose as *the draw*" stores it in the project guide as a pose entry. It can be
+  re-rendered from any angle and used as `entries=["pose/the draw"]`.
+
+**Where Blender comes from:** a small Docker image, `docker/Dockerfile.blender`. It downloads the **official
+portable Linux build** of Blender (5.2 LTS) from download.blender.org and checks its SHA-256, so nothing is
+installed on your computer.
+- Renders run on the CPU, so they never take GPU memory from FLUX. A render takes about 5-15 s.
+- `setup.py` builds the image (`--skip-blender` leaves it out, `--blender-only` adds it to an existing install).
+  You can also just ask Claude to "set up Blender for poses", which calls the `setup_blender` tool.
+- For another Blender release, use `setup_blender(version="5.3.0")`. The checksum is fetched from
+  download.blender.org.
+
+**Without Docker** (for example with an external ComfyUI), install Blender yourself and point the plugin at it:
+1. Get Blender 4.2 or newer from https://www.blender.org/download/. There are three ways:
+   - The Windows `.zip` or the Linux `.tar.xz` are portable: unpack them anywhere.
+   - On macOS, drag Blender into Applications.
+   - Or use a package manager: `winget install BlenderFoundation.Blender`, `brew install --cask blender`,
+     or `snap install blender --classic`.
+2. Ask Claude to run `setup_blender(path=...)` with the Blender executable. That is
+   `...\blender.exe` on Windows, `/Applications/Blender.app/Contents/MacOS/Blender` on macOS, or
+   `.../blender` on Linux. The plugin checks the executable and saves it as `blender_path`.
+3. `blender_status` shows which Blender is in use. Running `setup_blender()` again goes back to the Docker image.
+
 ## Configuration: `~/.local-imagen/config.json`
 
 | Key | Default | Meaning |
@@ -93,9 +140,12 @@ All paths inside a project are relative, so a project folder works on any OS and
 | `ollama_url` | `http://127.0.0.1:11434` | Ollama models are unloaded from the GPU while generating and reloaded on stop |
 | `candidates` | `3` | candidates per request |
 | `model` | FLUX.2 klein 4B files | override the `unet` / `text_encoder` / `vae` file names |
+| `blender_path` | unset | a Blender on this computer for `render_pose` (set by `setup_blender(path=...)`); unset = Docker image |
+| `blender_image` | `local/imagen-blender:latest` | the Blender Docker image |
 
 Environment variables override the file (`LOCAL_IMAGEN_HOME`, `LOCAL_IMAGEN_PROJECTS`, `COMFYUI_URL`,
-`COMFYUI_DOCKER_DIR`, `COMFYUI_MANAGE_DOCKER`, `OLLAMA_URL`, `LOCAL_IMAGEN_CANDIDATES`).
+`COMFYUI_DOCKER_DIR`, `COMFYUI_MANAGE_DOCKER`, `OLLAMA_URL`, `LOCAL_IMAGEN_CANDIDATES`, `LOCAL_IMAGEN_BLENDER`,
+`LOCAL_IMAGEN_BLENDER_IMAGE`).
 
 ## Update / remove
 ```
@@ -114,11 +164,13 @@ plugins/local-imagen/
   agents/image-picker.md          private best-of-N judge
   skills/local-imagen-setup/      install / verify / troubleshoot
   server/server.py, mcp_call.py   MCP server + shell bridge (pass --session <id> to keep a session across calls)
+  server/blender/                 pose_render.py (runs inside Blender: mannequin, posing, render) + poses.json presets
   scripts/setup.py                machine setup (stdlib only)
-  docker/                         Dockerfile, docker-compose.yml, download_models.py
+  docker/                         Dockerfile, docker-compose.yml, download_models.py, Dockerfile.blender
 ```
 
 ## Licences
 - Plugin code: yours to share.
 - FLUX.2 klein 4B: Apache 2.0, so images can be used commercially.
+- Blender: GPL, downloaded from blender.org when the image is built (not bundled here). Its renders are yours.
 - Check the rights on any reference images you add.

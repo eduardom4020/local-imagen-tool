@@ -6,6 +6,8 @@
   python setup.py --models core extras     also download the comparison models (~26 GB more)
   python setup.py --external-url URL       use an existing ComfyUI instead of Docker (no build/start)
   python setup.py --home PATH              data folder (default ~/.local-imagen)
+  python setup.py --blender-only           only build the Blender pose-renderer image (existing installs)
+  python setup.py --skip-blender           leave out the Blender pose renderer
 
 Writes ~/.local-imagen/config.json (read by the MCP server). Safe to re-run: finished steps are skipped.
 """
@@ -25,6 +27,7 @@ CFG_FILE = CFG_DIR / "config.json"
 COMPOSE_PROJECT = "comfyui"
 MODELS_VOLUME = f"{COMPOSE_PROJECT}_comfyui-models"
 CORE_FILES = ["flux-2-klein-4b.safetensors"]
+BLENDER_IMAGE = "local/imagen-blender:latest"
 
 
 def step(msg):
@@ -147,6 +150,26 @@ def verify_models(url):
     print(f"   models visible to ComfyUI: {', '.join(unets)}")
 
 
+def build_blender():
+    """Headless Blender for render_pose: official portable Linux build, checksum-verified, CPU only. The Dockerfile
+    is piped in, so no build context is sent."""
+    step("Building the Blender pose-renderer image (~1-2 min, ~400 MB download)")
+    with open(PLUGIN / "docker" / "Dockerfile.blender", "rb") as fh:
+        p = subprocess.Popen(["docker", "build", "-t", BLENDER_IMAGE, "-"], stdin=fh, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        out = []
+        for line in p.stdout:
+            out.append(line)
+            print("   " + line.rstrip(), flush=True)
+        if p.wait() != 0:
+            sys.exit("FAILED: Blender image build\n" + "".join(out[-20:]))
+    code, out = run(["docker", "run", "--rm", BLENDER_IMAGE, "--version"], check=False, quiet=True, timeout=300)
+    line = next((x for x in out.splitlines() if x.startswith("Blender ")), "")
+    if code != 0 or not line:
+        sys.exit("Blender image built but Blender did not start:\n" + out[-800:])
+    print(f"   {line.strip()}: render_pose is ready")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="only check prerequisites")
@@ -157,7 +180,18 @@ def main():
     ap.add_argument("--force-copy", action="store_true", help="overwrite the Docker files in docker-dir")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-models", action="store_true")
+    ap.add_argument("--skip-blender", action="store_true", help="leave out the Blender pose renderer")
+    ap.add_argument("--blender-only", action="store_true", help="only build the Blender pose-renderer image")
     args = ap.parse_args()
+
+    if args.blender_only:
+        step("Checking Docker")
+        if not shutil.which("docker") or not ensure_docker():
+            sys.exit("Docker is not available. Without Docker, install Blender and ask Claude to run "
+                     "setup_blender(path=<blender executable>).")
+        build_blender()
+        print("\nBLENDER SETUP OK. render_pose works now (no restart needed).")
+        return
 
     prereqs_ok = check_prereqs()
     if args.external_url:
@@ -206,6 +240,9 @@ def main():
              "-v", f"{docker_dir}:/work:ro", "python:3.12-slim", "sh", "-c",
              "pip install -q --root-user-action=ignore huggingface_hub && python /work/download_models.py "
              + " ".join(args.models)], cwd=docker_dir)
+
+    if not args.skip_blender:
+        build_blender()
 
     step("Starting ComfyUI and verifying")
     run(["docker", "compose", "up", "-d"], cwd=docker_dir)

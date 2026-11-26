@@ -1,0 +1,32 @@
+# Headless Blender for the local-imagen pose renderer (render_pose). Runs on the CPU: no GPU needed, so it never
+# competes with FLUX for video memory, and it works next to an external ComfyUI too.
+# Downloads the official portable Linux build from download.blender.org and checks its SHA-256.
+#
+# Build:  docker build -f Dockerfile.blender -t local/imagen-blender:latest .
+# Other version: --build-arg BLENDER_VERSION=x.y.z --build-arg BLENDER_SHA256=<sha256 of blender-x.y.z-linux-x64.tar.xz>
+#                (checksums: https://download.blender.org/release/Blender<x.y>/blender-<x.y.z>.sha256)
+
+FROM debian:trixie-slim AS download
+ARG BLENDER_VERSION=5.2.5
+ARG BLENDER_SHA256=6a93f1316ea794dec3027129fbc05f48b368184be25a8f993dd0301a6020a204
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL --retry 4 -o /tmp/blender.tar.xz \
+      "https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+ && echo "${BLENDER_SHA256}  /tmp/blender.tar.xz" | sha256sum -c - \
+ && mkdir -p /opt/blender \
+ && tar -xJf /tmp/blender.tar.xz -C /opt/blender --strip-components=1 \
+ && rm /tmp/blender.tar.xz
+
+FROM debian:trixie-slim
+ARG BLENDER_VERSION=5.2.5
+# X11/GL client libraries the official build links against (nothing is displayed; renders run in background mode)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxext6 \
+      libxkbcommon0 libsm6 libice6 libgl1 libegl1 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=download /opt/blender /opt/blender
+RUN ln -s /opt/blender/blender /usr/local/bin/blender && blender -b --factory-startup --version
+LABEL org.opencontainers.image.title="local-imagen Blender (headless)" blender.version="${BLENDER_VERSION}"
+ENTRYPOINT ["blender", "-b", "--factory-startup"]

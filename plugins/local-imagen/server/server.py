@@ -185,7 +185,7 @@ SECTION_TITLES = {"style": "Art style", "character": "Characters", "creature": "
                   "location": "Locations", "prop": "Props", "pose": "Pose", "camera": "Camera"}
 GUIDE_TITLES = {"style": "Styles", "character": "Characters", "creature": "Creatures", "location": "Locations",
                 "prop": "Props", "pose": "Poses", "camera": "Cameras"}
-REF_PRIORITY = {"character": 0, "creature": 0, "style": 1, "location": 2, "prop": 3}  # other kinds: 4
+REF_PRIORITY = {"pose": -0.5, "character": 0, "creature": 0, "style": 1, "location": 2, "prop": 3}  # others: 4
 ROLE_TEXT = {
     "style": "the art style to use: match its linework, colouring, shading, palette and texture, but do not copy "
              "its content",
@@ -313,6 +313,14 @@ SID = _ENV_SID or f"{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
 SDIR = SESSIONS / SID
 CAND = SDIR / "candidates"   # all candidates of open requests (hidden from the user unless asked)
 SEL = SDIR / "selected"      # the picked candidate of each open request, waiting for the user's approval
+POSES = SDIR / "poses"       # mannequin pose guides rendered by render_pose
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+BLENDER_DIR = Path(__file__).resolve().parent / "blender"   # pose_render.py (runs inside Blender) + poses.json
+BLENDER_IMAGE = "local/imagen-blender:latest"
+BLENDER_LOG = HOME / "logs" / "blender-setup.log"
+BLENDER_STATE = HOME / "blender-setup.json"
+BLENDER_BUILD: subprocess.Popen | None = None
+_BG_TASKS: set = set()
 S: dict = {"project": None, "scratch": False, "active": [], "candidates": None, "requests": {},
            "last_request": None, "started": now_iso()}
 S.update(_load(SDIR / "session.json", {}))
@@ -855,21 +863,7 @@ async def _start_container(notes: list):
         raise RuntimeError(f"ComfyUI is not answering at {COMFY} and manage_docker is off: start ComfyUI yourself")
     if not (DOCKER_DIR / "docker-compose.yml").exists():
         raise RuntimeError(f"no docker-compose.yml in {DOCKER_DIR}: run the local-imagen-setup skill first")
-    if not await asyncio.to_thread(_docker_ready):
-        desktop = _docker_desktop()
-        if desktop:
-            subprocess.Popen([str(desktop)], env=_env(), creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-a", "Docker"], env=_env())
-        else:
-            raise RuntimeError("Docker engine is not running (Linux: sudo systemctl start docker)")
-        notes.append("started Docker Desktop")
-        for _ in range(60):
-            await asyncio.sleep(3)
-            if await asyncio.to_thread(_docker_ready):
-                break
-        else:
-            raise RuntimeError("Docker Desktop did not become ready in 3 minutes")
+    await _ensure_docker(notes)
     r = await asyncio.to_thread(_run, ["docker", "compose", "up", "-d"], str(DOCKER_DIR), 600)
     if r.returncode != 0:
         raise RuntimeError("docker compose up failed: " + (r.stderr or r.stdout)[-800:])
@@ -964,14 +958,41 @@ async def run_workflow(c: httpx.AsyncClient, wf: dict, timeout=900) -> bytes:
 
 
 # ---------------------------------------------------------------- prompt planning
-def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_default_style: bool) -> dict:
+def _pose_ref(pose: str) -> dict:
+    """generate_image(pose=...): a render_pose image (path or name from this session), any pose image file, or a
+    guide pose entry of the open project."""
+    p = pose.strip().strip('"')
+    cand = [Path(p).expanduser(), POSES / p, POSES / f"{p}.png"]
+    hit = next((c for c in cand if c.is_file() and c.suffix.lower() in IMG_EXT), None)
+    if hit:
+        return {"path": hit, "legend": POSE_LEGEND, "source": f"pose guide {hit.stem}"}
+    if S.get("project"):
+        proj, _ = current()
+        e = _find_entry(proj, p if "/" in p else f"pose/{p}")
+        pr = _primary_ref(e)
+        if not pr:
+            raise ValueError(f"guide entry {_eid(e)} has no reference image to use as the pose")
+        return {"path": e["_dir"] / pr["file"], "legend": POSE_LEGEND if e.get("pose_spec") else ROLE_TEXT["pose"],
+                "source": _eid(e), "file": (e["_dir"] / pr["file"]).relative_to(proj).as_posix()}
+    raise ValueError(f"pose '{pose}' is not an image file or a pose rendered in this session")
+
+
+def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_default_style: bool,
+          pose: str = "", pose_crop: bool = True) -> dict:
     """Compose the full prompt and pick the references (max 4) for one request in this session's context."""
     notes: list[str] = []
+    pose_r = _pose_ref(pose) if pose.strip() else None
     if not S.get("project"):  # one-off images: the original behaviour
         if entry_names:
             raise ValueError("guide entries need a project; this session makes one-off images")
         refs = [{"path": LIB / r["file"], "source": f"attached '{r['label']}'"} for r in S["active"]] if use_refs else []
-        text = (STYLE_PREFIX + prompt) if refs and mode == "style" else prompt
+        if pose_r:  # say what each image is, so the pose guide isn't taken for a style reference
+            refs = (refs + [pose_r])[:MAX_REFS]
+            other = ROLE_TEXT["style"] if mode == "style" else "what the prompt describes"
+            legend = " ".join(f"Image {i} shows {r.get('legend') or other}." for i, r in enumerate(refs, 1))
+            text = f"{prompt.strip()}\n\nReference images: {legend}"
+        else:
+            text = (STYLE_PREFIX + prompt) if refs and mode == "style" else prompt
         return {"text": text, "refs": refs, "entries": [], "checklist": [], "notes": notes, "project": None}
 
     proj, info = current()
@@ -1010,15 +1031,32 @@ def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_de
         for r in S["active"]:
             legend = ROLE_TEXT["style"] if mode == "style" else f"'{r['label']}' (use it as the prompt describes)"
             ranked.append((-1, {"path": LIB / r["file"], "legend": legend, "source": f"attached '{r['label']}'"}))
+        if pose_r:
+            ranked.append((-0.5, pose_r))
+        posed = bool(pose_r) or any(e["kind"] == "pose" and _primary_ref(e) for e in chosen)
         for e in chosen:
             pr = _primary_ref(e)
             if pr:
                 legend = ROLE_TEXT.get(e["kind"], "{name}").format(name=e["name"])
-                if pr.get("role"):
+                if e["kind"] == "pose" and e.get("pose_spec"):
+                    legend = POSE_LEGEND
+                elif pr.get("role"):
                     legend += f" ({pr['role']})"
-                ranked.append((REF_PRIORITY.get(e["kind"], 4),
-                               {"path": e["_dir"] / pr["file"], "legend": legend, "source": _eid(e),
-                                "file": (e["_dir"] / pr["file"]).relative_to(proj).as_posix()}))
+                ref = {"path": e["_dir"] / pr["file"], "legend": legend, "source": _eid(e),
+                       "file": (e["_dir"] / pr["file"]).relative_to(proj).as_posix()}
+                if posed and pose_crop and e["kind"] in ("character", "creature", "style"):
+                    # a full-body figure in any reference overrides the pose guide: keep only its head and chest
+                    crop = _head_chest_crop(ref["path"], f"{pr.get('label', '')} {pr.get('role', '')}")
+                    if crop:
+                        legend = (f"{e['name']}: keep the same face, hair, outfit and colours (this image shows only "
+                                  "the head and chest; take the body pose from the pose guide)")
+                        if e["kind"] == "style":
+                            legend = ("the art style to use (a detail of the style reference): match its linework, "
+                                      "colouring, shading, palette and texture, not its content or pose")
+                        ref = {"path": crop, "source": f"{_eid(e)} (head and chest crop)", "legend": legend}
+                        notes.append(f"{_eid(e)}'s reference was cropped to head and chest so the pose guide sets "
+                                     "the pose (pose_crop=False keeps it whole)")
+                ranked.append((REF_PRIORITY.get(e["kind"], 4), ref))
     refs = [r for _, r in sorted(ranked, key=lambda x: x[0])]
     if len(refs) > MAX_REFS:
         notes.append("left out (max 4 references per image): " + ", ".join(r["source"] for r in refs[MAX_REFS:]))
@@ -1101,7 +1139,12 @@ mcp = MCPServer(
         "the subagent returns), with at most one or two short lines. Use show_candidates only when the user "
         "explicitly asks. When the user likes the pick, call approve_image; discard_image drops it. End with one "
         "short line that the image session is still up and they can ask you to clear it (clear_session); no "
-        "explanation about ComfyUI or Ollama."
+        "explanation about ComfyUI or Ollama.\n\n"
+        "POSE GUIDES. render_pose draws a grey mannequin in a pose with Blender (presets + joint angles, any camera "
+        "angle); the image-picker uses it for action and acrobatic poses via generate_image(pose=...). If it says "
+        "Blender isn't set up, call setup_blender() (builds a small Docker image from the official Blender build) "
+        "or, without Docker, setup_blender(path=<installed blender>); blender_status shows the state. When the "
+        "user wants to keep a pose, render_pose(..., save_to='<name>') saves it as a guide pose entry."
     ),
 )
 
@@ -1533,7 +1576,8 @@ async def guide_remove_reference(name: str, reference: str) -> str:
 async def generate_image(prompt: str, entries: list[str] | None = None, project: str = "", aspect: str = "portrait",
                          width: int = 0, height: int = 0, seed: int = -1, candidates: int = 0,
                          use_references: bool = True, reference_mode: str = "style", use_default_style: bool = True,
-                         steps: int = 4, preview_size: int = 512, dry_run: bool = False) -> list:
+                         pose: str = "", pose_crop: bool = True, steps: int = 4, preview_size: int = 512,
+                         dry_run: bool = False) -> list:
     """Render N candidate images for one request with FLUX.2 klein 4B (local ComfyUI). You then MUST call
     pick_candidate with the best one; only the picked image is presented to the user.
 
@@ -1550,7 +1594,11 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     use_references: False sends no reference images this time (descriptions are still used).
     reference_mode: 'style' = ad-hoc attached references give only the art style; 'edit' = they are content to
                     edit/combine and the prompt may refer to 'image 1', 'image 2' (attached ones come first).
-    Max 4 reference images per image: attached ones first, then characters/creatures, style, locations, props.
+    pose: a pose guide that sets the body pose: a render_pose mannequin (its path or name), any pose image, or a
+          guide pose entry. Full-length character, creature and style references are then cropped to head and
+          chest (pose_crop=False keeps them whole), because a full-body figure makes the model copy its pose.
+    Max 4 reference images per image: attached ones first, then the pose guide, characters/creatures, style,
+    locations, props.
     dry_run: only return the composed prompt, references and checklist (nothing is rendered).
     Starts Docker/ComfyUI automatically if needed (and frees the GPU from Ollama).
     """
@@ -1581,7 +1629,7 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     w, h = (max(256, min(2048, v)) // 16 * 16 for v in (w, h))
     if reference_mode not in ("style", "edit"):
         raise ValueError("reference_mode must be 'style' or 'edit'")
-    plan = _plan(prompt, entries or [], use_references, reference_mode, use_default_style)
+    plan = _plan(prompt, entries or [], use_references, reference_mode, use_default_style, pose, pose_crop)
     checklist = ("\nChecklist (judge the candidates against it):\n" + "\n".join(f"- {c}" for c in plan["checklist"])
                  if plan["checklist"] else "")
     ref_lines = "\n".join(f"  image {i}: {r['source']}" for i, r in enumerate(plan["refs"], 1)) or "  none"
@@ -1755,7 +1803,8 @@ async def clear_session(stop: bool = True) -> str:
     for rid in list(S["requests"]):
         _close_request(rid, delete_selected=True)
     prev = _mode_text()
-    S.update(active=[], candidates=None, last_request=None, project=None, scratch=False)
+    S.update(active=[], candidates=None, last_request=None, project=None, scratch=False, poses=[])
+    shutil.rmtree(POSES, ignore_errors=True)
     _save_session()
     msg = (f"Session cleared ({prev} closed): {n_open} unapproved image(s) discarded, references detached, "
            f"{DEFAULT_CANDIDATES} candidates per request. The next request will ask which project to use.")
@@ -1929,6 +1978,535 @@ async def stop_backend(restore_ollama: bool = True, force: bool = False) -> str:
     """Stop the ComfyUI container (models stay installed) and reload the Ollama models it unloaded. If another
     Claude session is still using ComfyUI, it keeps running unless force=True (ask the user first)."""
     return await asyncio.to_thread(_stop_sync, restore_ollama, force)
+
+
+# ---------------------------------------------------------------- pose guides (Blender)
+# A posable mannequin rendered by Blender in background mode: in the local-imagen Blender Docker image by default
+# (official portable Linux build, CPU only), or with a Blender installed on this computer (setting blender_path).
+def _cfg_update(updates: dict):
+    with _lock("config"):
+        cfg = _cfg()
+        for k, v in updates.items():
+            if v is None:
+                cfg.pop(k, None)
+            else:
+                cfg[k] = v
+        CFG_DIR.mkdir(parents=True, exist_ok=True)
+        _save(CFG_FILE, cfg)
+
+
+def _blender_path() -> str:
+    """Host Blender executable when one is configured (re-read every time, so setup_blender applies at once)."""
+    return (os.environ.get("LOCAL_IMAGEN_BLENDER") or str(_cfg().get("blender_path") or "")).strip()
+
+
+def _blender_image() -> str:
+    return str(os.environ.get("LOCAL_IMAGEN_BLENDER_IMAGE") or _cfg().get("blender_image") or BLENDER_IMAGE)
+
+
+def _host_blender_version(path: str) -> str:
+    r = _run([path, "-b", "--factory-startup", "--version"], timeout=120)
+    m = re.search(r"Blender (\d+\.\d+(?:\.\d+)?)", r.stdout or "")
+    if r.returncode != 0 or not m:
+        raise RuntimeError(f"'{path}' did not run as Blender: " + ((r.stderr or r.stdout) or "no output")[-400:])
+    return m.group(1)
+
+
+def _image_blender_version() -> str | None:
+    """Blender version inside the local-imagen Blender image, or None if the image isn't built."""
+    try:
+        r = _run(["docker", "image", "inspect", "--format", '{{index .Config.Labels "blender.version"}}',
+                  _blender_image()], timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (r.stdout.strip() or "unknown") if r.returncode == 0 else None
+
+
+async def _ensure_docker(notes: list):
+    if await asyncio.to_thread(_docker_ready):
+        return
+    desktop = _docker_desktop()
+    if desktop:
+        subprocess.Popen([str(desktop)], env=_env(), creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-a", "Docker"], env=_env())
+    else:
+        raise RuntimeError("Docker engine is not running (Linux: sudo systemctl start docker)")
+    notes.append("started Docker Desktop")
+    for _ in range(60):
+        await asyncio.sleep(3)
+        if await asyncio.to_thread(_docker_ready):
+            return
+    raise RuntimeError("Docker Desktop did not become ready in 3 minutes")
+
+
+def _blender_sha256(version: str) -> str:
+    """Official checksum of the Linux build, from download.blender.org."""
+    mm = ".".join(version.split(".")[:2])
+    url = f"https://download.blender.org/release/Blender{mm}/blender-{version}.sha256"
+    r = httpx.get(url, timeout=60, follow_redirects=True)
+    r.raise_for_status()
+    for line in r.text.splitlines():
+        if line.strip().endswith(f"blender-{version}-linux-x64.tar.xz"):
+            return line.split()[0]
+    raise ValueError(f"no Linux x64 build of Blender {version} listed in {url}")
+
+
+def _build_state() -> dict:
+    st = _load(BLENDER_STATE, {})
+    if st.get("status") == "running" and not _proc_alive(st.get("pid"), st.get("pid_created")):
+        st["status"] = "interrupted"  # the server that ran the build has gone
+    return st
+
+
+def _log_tail(n: int = 6) -> str:
+    try:
+        lines = [x for x in BLENDER_LOG.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+    except FileNotFoundError:
+        return ""
+    return "\n".join("    " + x[-160:] for x in lines[-n:])
+
+
+def _blender_summary() -> str:
+    hp = _blender_path()
+    if hp:
+        try:
+            return f"host Blender {_host_blender_version(hp)} at {hp}"
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            return f"host Blender at {hp} is not working ({e}); fix it or run setup_blender() for the Docker image"
+    if not _docker_ready():
+        return "unknown: Docker is not running (setup_blender and render_pose start it)"
+    v = _image_blender_version()
+    if v:
+        return f"Docker image {_blender_image()} with Blender {v}"
+    return ("not set up: call setup_blender() to build the Blender Docker image (about 1-2 min, ~400 MB "
+            "download), or install Blender on this computer and call setup_blender(path=<blender executable>)")
+
+
+def _pose_presets() -> dict:
+    try:
+        return {k: v for k, v in json.loads((BLENDER_DIR / "poses.json").read_text(encoding="utf-8")).items()
+                if not k.startswith("_")}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+POSE_PARTS = {
+    "root": {"turn", "pitch", "roll", "lift", "ground"}, "spine": {"bend", "side", "twist"},
+    "head": {"nod", "tilt", "turn"},
+    "left_arm": {"aim", "twist", "elbow", "wrist", "wrist_tilt", "hand"},
+    "right_arm": {"aim", "twist", "elbow", "wrist", "wrist_tilt", "hand"},
+    "left_leg": {"aim", "twist", "knee", "ankle"}, "right_leg": {"aim", "twist", "knee", "ankle"},
+}
+AIM_WORDS = {"forward", "front", "back", "backward", "up", "down", "out", "outward", "side", "in", "across", "inward"}
+AIM_KEYS = {"forward", "back", "up", "down", "out", "in", "across"}
+POSE_VIEWS = {"front": 0, "three-quarter": 35, "side": 90, "back-three-quarter": 145, "back": 180}
+POSE_LEGEND = ("the pose to use, shown on a plain grey artist's mannequin: copy its body pose, limb angles, balance "
+               "and camera angle; do not draw the mannequin, its grey colour or its plain background")
+
+
+def _pose_entry_spec(name: str) -> tuple[dict, dict] | None:
+    """(pose, camera) of a guide pose entry saved with render_pose(save_to=...)."""
+    if not S.get("project"):
+        return None
+    proj, _ = current()
+    try:
+        e = _find_entry(proj, name if "/" in name else f"pose/{name}")
+    except ValueError:
+        return None
+    if not e.get("pose_spec"):
+        raise ValueError(f"guide entry {_eid(e)} has no saved mannequin pose (render_pose(..., save_to=...) saves "
+                         "one)")
+    return json.loads(json.dumps(e["pose_spec"])), dict(e.get("pose_camera") or {})
+
+
+def _mirror_pose(spec: dict) -> dict:
+    """Swap the figure's left and right (a left-handed version of the pose)."""
+    out: dict = {}
+    for k, v in spec.items():
+        if k == "props":
+            out[k] = [{**p, "hand": "left" if str(p.get("hand", "right")).lower() == "right" else "right"}
+                      for p in v]
+            continue
+        nk = ("right_" + k[5:]) if k.startswith("left_") else ("left_" + k[6:]) if k.startswith("right_") else k
+        v = dict(v)
+        if k in ("root", "spine", "head"):
+            for key in ("turn", "roll", "twist", "side", "tilt"):
+                if key in v:
+                    v[key] = -float(v[key])
+        out[nk] = v  # limb values are side-relative already
+    return out
+
+
+def _resolve_pose(pose) -> tuple[dict, dict]:
+    """Preset name / guide pose entry / dict (optionally {"preset": ...} plus overrides) -> (full pose dict,
+    the preset's suggested camera)."""
+    presets = _pose_presets()
+    if isinstance(pose, str):
+        pose = pose.strip()
+        if pose.startswith("{"):
+            pose = json.loads(pose)
+        else:
+            pose = {"preset": pose or "stand"}
+    if not isinstance(pose, dict):
+        raise ValueError("pose must be a preset name or an object")
+    pose = json.loads(json.dumps(pose))
+    base: dict = {}
+    hint: dict = {}
+    pre = pose.pop("preset", None)
+    if pre:
+        if pre in presets:
+            base = {k: v for k, v in presets[pre].items() if not k.startswith("_")}
+            hint = dict(presets[pre].get("_camera") or {})
+        else:
+            found = _pose_entry_spec(pre)
+            if found is None:
+                raise ValueError(f"unknown pose preset '{pre}'. Presets: {', '.join(presets)}"
+                                 + ("" if S.get("project") else " (guide poses need a project)"))
+            base, hint = found
+    for k, v in pose.items():
+        if k == "props":
+            if not isinstance(v, list):
+                raise ValueError("props must be a list, e.g. [{'type': 'sword', 'hand': 'right'}]")
+            for p in v:
+                if not isinstance(p, dict) or p.get("type") != "sword":
+                    raise ValueError("the only prop so far is {'type': 'sword', 'hand': 'right'|'left', "
+                                     "'grip': 'normal'|'reverse', 'length': <blade length in heads, default 3.2>, "
+                                     "'two_handed': true|false}")
+            base["props"] = v
+        elif k in POSE_PARTS:
+            if not isinstance(v, dict):
+                raise ValueError(f"pose.{k} must be an object with keys {sorted(POSE_PARTS[k])}")
+            bad = set(v) - POSE_PARTS[k]
+            if bad:
+                raise ValueError(f"unknown key(s) {sorted(bad)} in pose.{k}; valid: {sorted(POSE_PARTS[k])}")
+            aim = v.get("aim")
+            if isinstance(aim, str):
+                words = [w for w in re.split(r"[-+ _]", aim.lower()) if w]
+                if not words or set(words) - AIM_WORDS:
+                    raise ValueError(f"pose.{k}.aim '{aim}': use words from {', '.join(sorted(AIM_WORDS))} joined "
+                                     "by '-', or an object like {'forward': 1, 'up': 0.3, 'out': 0.2}")
+            elif aim is not None and not (isinstance(aim, dict) and set(aim) <= AIM_KEYS):
+                raise ValueError(f"pose.{k}.aim must be an object with keys from {sorted(AIM_KEYS)} (e.g. "
+                                 "{'forward': 1, 'up': 0.3}) or a string like 'forward-up'")
+            if "hand" in v and v["hand"] not in ("relaxed", "open", "fist"):
+                raise ValueError(f"pose.{k}.hand must be relaxed, open or fist")
+            base[k] = {**(base.get(k) or {}), **v}
+        elif not k.startswith("_"):
+            raise ValueError(f"unknown pose key '{k}'; valid: preset, props, {', '.join(POSE_PARTS)}")
+    return base, hint
+
+
+def _render_jobs(jobs: list[dict], out_dir: Path, timeout: int = 600) -> str:
+    """Run pose_render.py once for several jobs; returns Blender's output. Docker image unless blender_path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    hp = _blender_path()
+    if hp:
+        for j in jobs:
+            j["out"] = str(out_dir)
+        jf = out_dir / "_jobs.json"
+        _save(jf, {"jobs": jobs})
+        cmd = [hp, "-b", "--factory-startup", "--python", str(BLENDER_DIR / "pose_render.py"), "--", str(jf)]
+    else:
+        for j in jobs:
+            j["out"] = "/out"
+        _save(out_dir / "_jobs.json", {"jobs": jobs})
+        cmd = ["docker", "run", "--rm", "--network", "none", "-e", "HOME=/tmp",
+               "--mount", f"type=bind,src={BLENDER_DIR},dst=/work,readonly",
+               "--mount", f"type=bind,src={out_dir},dst=/out"]
+        if sys.platform.startswith("linux") and hasattr(os, "getuid"):
+            cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]  # files in the session folder stay the user's
+        cmd += [_blender_image(), "--python", "/work/pose_render.py", "--", "/out/_jobs.json"]
+    r = _run(cmd, timeout=timeout)
+    out = (r.stdout or "") + (r.stderr or "")
+    if "POSE_ALL_DONE" not in out:
+        fails = [x for x in out.splitlines() if x.startswith("POSE_FAILED")]
+        raise RuntimeError("Blender pose render failed: " + ("; ".join(fails) or out[-900:]))
+    return out
+
+
+def _flatten_white(path: Path):
+    im = PILImage.open(path).convert("RGBA")
+    bg = PILImage.new("RGBA", im.size, (255, 255, 255, 255))
+    bg.alpha_composite(im)
+    bg.convert("RGB").save(path, "PNG")
+
+
+def _head_chest_crop(path: Path, about: str = "") -> Path | None:
+    """Head-and-chest crop of a full-length figure reference (used with a pose guide: a full-body reference makes
+    the model copy its pose). None when it isn't a full-length figure on a plain background, or its label/role
+    says it is a face, portrait or close-up."""
+    if re.search(r"face|portrait|close|head|bust|expression", about, re.I):
+        return None
+    from PIL import ImageChops
+    im = PILImage.open(path).convert("RGB")
+    w, h = im.size
+    small = im.copy()
+    small.thumbnail((320, 320))
+    sw, sh = small.size
+    px = small.load()
+    corners = [px[0, 0], px[sw - 1, 0], px[0, sh - 1], px[sw - 1, sh - 1]]
+    bg = tuple(sorted(c[i] for c in corners)[1] for i in range(3))
+    mask = ImageChops.difference(small, PILImage.new("RGB", small.size, bg)).convert("L").point(
+        lambda v: 255 if v > 28 else 0)
+    box = mask.getbbox()
+    if not box:
+        return None
+    x0, y0, x1, y1 = box
+    if (x1 - x0) > 0.97 * sw and (y1 - y0) > 0.97 * sh:
+        return None  # painted background: can't find the figure
+    bh, bw = y1 - y0, x1 - x0
+    if bh < 0.7 * sh or bh < 1.1 * bw:
+        return None  # not a full-length figure filling the picture: use it as it is
+    band = mask.crop((x0, y0, x1, y0 + max(2, int(bh * 0.12))))
+    cols = [sum(1 for yy in range(band.height) if band.getpixel((xx, yy))) for xx in range(band.width)]
+    cx = x0 + (sum(i * c for i, c in enumerate(cols)) / sum(cols) if sum(cols) else bw / 2)
+    ch = bh * 0.36
+    cw = min(bw, ch * 1.05)
+    pad = bh * 0.04
+    left = max(x0 - pad, min(cx - cw / 2, x1 - cw) - pad)
+    k = w / sw
+    crop = im.crop((int(max(0, left) * k), int(max(0, y0 - pad) * k), int(min(sw, left + cw + 2 * pad) * k),
+                    int(min(sh, y0 + ch + pad) * k)))
+    buf = io.BytesIO()
+    crop.save(buf, "PNG")
+    png, fid = _normalize(buf.getvalue())
+    if not (LIB / fid).exists():
+        _write_bytes(LIB / fid, png)
+    return LIB / fid
+
+
+@tool
+async def blender_status() -> str:
+    """Show whether the Blender pose renderer (render_pose) is ready: the Docker image or a host Blender, its
+    version, and the progress or result of the last setup_blender build."""
+    lines = ["Pose renderer: " + await asyncio.to_thread(_blender_summary)]
+    st = _build_state()
+    if st:
+        lines.append(f"Last setup_blender build ({st.get('started')}): {st.get('status')}"
+                     + (f", Blender {st['version']}" if st.get("version") else ""))
+        if st.get("status") in ("running", "failed", "interrupted"):
+            tail = _log_tail()
+            if tail:
+                lines.append("  log (" + str(BLENDER_LOG) + "):\n" + tail)
+    lines.append("Presets: " + ", ".join(_pose_presets()))
+    return "\n".join(lines)
+
+
+@tool
+async def setup_blender(path: str = "", version: str = "", sha256: str = "", wait_seconds: int = 540) -> str:
+    """Set up the Blender pose renderer used by render_pose.
+
+    Default (no path): builds the local-imagen Blender Docker image. It downloads the official portable Linux
+    build from download.blender.org and checks its SHA-256, so nothing is installed on this computer. About
+    1-2 min and ~400 MB of download; renders run on the CPU, so they never take GPU memory from FLUX.
+      version: another Blender release, e.g. '5.3.0' (its checksum is fetched from download.blender.org unless
+               sha256 is given). Default: the version pinned in docker/Dockerfile.blender.
+      wait_seconds: how long to wait for the build; if it takes longer it keeps going: call blender_status.
+    path: use a Blender installed on this computer instead (e.g. for an external ComfyUI without Docker):
+          the blender executable. It is checked, then saved as blender_path in ~/.local-imagen/config.json.
+          Run setup_blender() again later to go back to the Docker image.
+    """
+    if path.strip():
+        p = str(Path(path.strip().strip('"')).expanduser())
+        v = await asyncio.to_thread(_host_blender_version, p)
+        await asyncio.to_thread(_cfg_update, {"blender_path": p})
+        return f"Using host Blender {v} at {p} for render_pose (saved as blender_path)."
+    if os.environ.get("LOCAL_IMAGEN_BLENDER"):
+        raise ValueError("the LOCAL_IMAGEN_BLENDER environment variable points render_pose at a host Blender; "
+                         "remove it to use the Docker image")
+    global BLENDER_BUILD
+    if BLENDER_BUILD and BLENDER_BUILD.poll() is None:
+        raise ValueError("a Blender image build is already running in this session; call blender_status")
+    st = _build_state()
+    if st.get("status") == "running":
+        raise ValueError(f"another Claude session is already building the Blender image (since {st['started']}); "
+                         "call blender_status")
+    if version and not re.fullmatch(r"\d+\.\d+\.\d+", version.strip()):
+        raise ValueError("version must look like 5.2.5")
+    notes: list = []
+    await _ensure_docker(notes)
+    args = ["docker", "build", "-t", _blender_image()]
+    version = version.strip()
+    if version:
+        sha = sha256.strip() or await asyncio.to_thread(_blender_sha256, version)
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            raise ValueError("sha256 must be 64 hex characters")
+        args += ["--build-arg", f"BLENDER_VERSION={version}", "--build-arg", f"BLENDER_SHA256={sha}"]
+    args.append("-")  # the Dockerfile comes from stdin: no build context is sent
+    BLENDER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(BLENDER_LOG, "w", encoding="utf-8")
+    t0 = time.monotonic()
+    BLENDER_BUILD = subprocess.Popen(args, stdin=open(PLUGIN_DIR / "docker" / "Dockerfile.blender", "rb"),
+                                     stdout=log_fh, stderr=subprocess.STDOUT, env=_env(),
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    _save(BLENDER_STATE, {"status": "running", "started": now_iso(), "pid": ME_PID, "pid_created": ME_CREATED,
+                          "version": version or None, "image": _blender_image()})
+    while BLENDER_BUILD.poll() is None and time.monotonic() - t0 < max(5, wait_seconds):
+        await asyncio.sleep(2)
+    code = BLENDER_BUILD.poll()
+    head = ("[" + "; ".join(notes) + "] ") if notes else ""
+    if code is None:
+        task = asyncio.get_running_loop().create_task(_finish_build(log_fh, version))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+        return head + (f"Still building after {wait_seconds} s (big download?). It keeps going; call "
+                       "blender_status to follow it.")
+    return head + await _finish_build(log_fh, version, time.monotonic() - t0)
+
+
+async def _finish_build(log_fh, version: str, seconds: float | None = None) -> str:
+    while BLENDER_BUILD.poll() is None:
+        await asyncio.sleep(3)
+    log_fh.close()
+    ok = BLENDER_BUILD.returncode == 0
+    v = await asyncio.to_thread(_image_blender_version) if ok else None
+    _save(BLENDER_STATE, {**_load(BLENDER_STATE, {}), "status": "done" if ok else "failed", "version": v or version,
+                          "finished": now_iso()})
+    if not ok:
+        return f"Blender image build FAILED (exit {BLENDER_BUILD.returncode}):\n{_log_tail(12)}"
+    if _cfg().get("blender_path"):
+        await asyncio.to_thread(_cfg_update, {"blender_path": None})
+    took = f" in {seconds:.0f} s" if seconds is not None else ""
+    return (f"Built {_blender_image()} with Blender {v}{took}. render_pose is ready "
+            f"(presets: {', '.join(_pose_presets())}).")
+
+
+async def render_pose(pose: dict | str = "stand", view: str = "", facing: str = "",
+                      azimuth: float | None = None, elevation: float | None = None, distance: float | None = None,
+                      mirror: bool = False, ortho: bool = False, aspect: str = "portrait", width: int = 0,
+                      height: int = 0,
+                      heads: float = 7, build: float = 1.0, shoulders: float = 1.0, hips: float = 1.0,
+                      depth: bool = False, color_sides: bool = False, name: str = "", save_to: str = "",
+                      preview_size: int = 640) -> list:
+    proj_needed = bool(save_to.strip())
+    if proj_needed and not S.get("project"):
+        raise ValueError(NO_PROJECT)
+    spec, hint = _resolve_pose(pose)
+    if facing not in ("", "left", "right"):
+        raise ValueError("facing must be 'left' or 'right' (the side of the picture the figure faces)")
+    if view and view not in POSE_VIEWS:
+        raise ValueError(f"unknown view '{view}'; use {', '.join(POSE_VIEWS)} or azimuth=<degrees>")
+    if azimuth is None:
+        if view or "azimuth" not in hint:  # a named view, or the default three-quarter
+            azimuth = POSE_VIEWS[view or "three-quarter"] * (1 if facing == "left" else -1)
+        else:  # the preset's own camera; facing only picks the side it is seen from
+            azimuth = float(hint["azimuth"])
+            if facing and 0 < abs(azimuth) < 180:
+                azimuth = abs(azimuth) * (1 if facing == "left" else -1)
+    if mirror:
+        spec, azimuth = _mirror_pose(spec), -azimuth
+    elevation = float(hint.get("elevation", 5)) if elevation is None else elevation
+    distance = float(hint.get("distance", 4.0)) if distance is None else distance
+    if width and height:
+        w, h = width, height
+    elif aspect in ASPECTS:
+        w, h = ASPECTS[aspect]
+    else:
+        raise ValueError(f"unknown aspect '{aspect}'; use one of {list(ASPECTS)} or width+height")
+    w, h = (max(256, min(2048, v)) // 16 * 16 for v in (w, h))
+    stem = slugify(name) if name.strip() else f"pose-{dt.datetime.now():%H%M%S}"
+    while (POSES / f"{stem}.png").exists():
+        stem += "x"
+    job = {"name": stem, "width": w, "height": h, "samples": 24, "color_sides": bool(color_sides),
+           "outputs": ["mannequin", "depth"] if depth else ["mannequin"],
+           "figure": {"heads": heads, "build": build, "shoulders": shoulders, "hips": hips}, "pose": spec,
+           "camera": {"azimuth": azimuth, "elevation": elevation, "distance": distance, "ortho": bool(ortho),
+                      "margin": 0.06}}
+    notes: list = []
+    if not _blender_path():
+        await _ensure_docker(notes)
+        if not await asyncio.to_thread(_image_blender_version):
+            raise RuntimeError("the Blender pose renderer isn't set up yet: call setup_blender() (or "
+                               "setup_blender(path=...) for a Blender installed on this computer)")
+    t0 = time.monotonic()
+    await asyncio.to_thread(_render_jobs, [job], POSES)
+    png = POSES / f"{stem}.png"
+    await asyncio.to_thread(_flatten_white, png)
+    info = _load(POSES / f"{stem}.json", {})
+    info.update(spec=spec, figure=job["figure"], camera_settings=job["camera"])
+    _save(POSES / f"{stem}.json", info)
+    if info.get("warnings"):
+        notes.append("WARNING: " + "; ".join(info["warnings"]))
+    used = (info.get("camera") or {}).get("elevation_used")
+    if used is not None and abs(used - elevation) > 0.5:
+        notes.append(f"elevation raised to {used:g} so the camera stays above the floor (for a stronger low "
+                     "angle, lower distance)")
+    S["poses"] = [*S.get("poses", [])[-50:], str(png)]
+    _save_session()
+    files = [f"mannequin: {png}"] + ([f"depth: {POSES / (stem + '-depth.png')}"] if depth else [])
+    msg = [f"{'[' + '; '.join(notes) + '] ' if notes else ''}Pose guide '{stem}' ({w}x{h}, azimuth "
+           f"{azimuth:g}, elevation {elevation:g}, {time.monotonic() - t0:.0f} s).", *files,
+           "Look at it: check limbs, sides (color_sides=True tints the left side blue, the right warm), "
+           "the sword angle and balance; adjust and render again if needed. Then pass the mannequin path as "
+           "generate_image(pose=...)."]
+    if save_to.strip():
+        proj, _ = current()
+        with _plock(proj):
+            try:
+                e = _find_entry(proj, save_to if "/" in save_to else f"pose/{save_to}")
+            except ValueError as err:
+                if "ambiguous" in str(err):
+                    raise
+                e = None
+            if e is None:
+                s_ = slugify(save_to)
+                e = {"name": save_to.strip(), "slug": s_, "kind": "pose", "description": "", "concept": "",
+                     "must_have": [], "never": [], "tags": [], "notes": "", "refs": [], "examples": [],
+                     "created": now_iso(), "_dir": proj / "guide" / "pose" / s_}
+            e["pose_spec"] = spec
+            e["pose_camera"] = {"azimuth": azimuth, "elevation": elevation, "distance": distance,
+                                "ortho": bool(ortho), "heads": heads}
+            _add_refs_locked(e, [(f"mannequin {stem}", png.read_bytes())], "mannequin pose guide", True)
+            _write_guide_md(proj)
+        msg.append(f"Saved as guide entry {_eid(e)} (its mannequin is the primary reference; "
+                   f"render_pose(pose='{e['name']}') re-renders it from any angle).")
+    return ["\n".join(msg), _preview(png.read_bytes(), preview_size)]
+
+
+render_pose.__doc__ = f"""Render a pose guide: a plain grey artist's mannequin in the given pose, on white, with
+    Blender. Use it for action, combat and acrobatic poses, where the image model easily mixes up limbs: render
+    the pose, look at it, fix it, then pass the mannequin path to generate_image(pose=...). Renders take ~5-10 s.
+
+    pose: a preset name, or an object: {{"preset": "<name>", ...overrides}} or a full pose. Presets:
+          {"; ".join(f"{k} ({v.get('_about', '')})" for k, v in _pose_presets().items())}.
+          With a project open, a guide pose entry saved with save_to also works as a preset.
+          Keys (angles in degrees; sides are the figure's own left/right; arm and leg directions are relative
+          to the chest / hips):
+            root: turn (+ toward the figure's left), pitch (+ lean/flip forward), roll (+ lean to its left),
+                  lift (height above the ground, in heads; the lowest point is put on the floor otherwise)
+            spine: bend (+ forward, - arch back), side (+ to its left), twist (+ chest turns to its left)
+            head: nod (+ down), tilt (+ toward its left shoulder), turn (+ to its left)
+            left_arm / right_arm: aim (upper arm direction: {{"forward": f, "up": u, "out": o}}, negatives =
+                  back / down / across the body; or words like "forward-up", "down-out"), elbow (bend),
+                  twist (+ turns the arm outward: changes which way the elbow bends), wrist (+ toward the palm),
+                  wrist_tilt (+ toward the thumb; tilts a held sword), hand (relaxed / open / fist)
+            left_leg / right_leg: aim (thigh direction, same form), knee (bend), ankle (+ toes down),
+                  twist (+ knee and toes turn outward)
+            props: [{{"type": "sword", "hand": "right", "grip": "normal" | "reverse", "length": 3.2,
+                     "two_handed": false}}] (two_handed: the other arm is placed automatically so its fist
+                     holds the grip too; the other arm's own settings are then ignored)
+    Camera: by default a preset's own camera (the action presets come with a dramatic one), else three-quarter.
+    view: front, three-quarter, side, back-three-quarter, back. facing: right / left, the side of the picture the
+          figure faces (with a preset camera it only picks the side it is seen from). azimuth: exact camera
+          angle instead (0 = front, + = from the figure's left). elevation: camera height angle (+ = from above,
+          - = low angle looking up; the camera stays above the floor, so a stronger low angle needs a lower
+          distance). distance: camera distance in figure heights (default 4; 2.5-3 = strong perspective).
+    Tips: show the main limb (sword arm, kicking leg) broadside to the camera: a limb pointing at the camera is
+          foreshortened and reads poorly. Low angles (elevation -10 to -20, distance 2.5-3) make action heroic.
+    mirror: swap the figure's left and right (and the camera side): a left-handed version of the pose. Keep it
+            off for a right-handed character; move the camera with facing instead.
+    ortho: no perspective.
+    aspect / width / height: use the same as the image you will generate.
+    heads: figure height in heads (from the character's guide entry if it says; default 7). build, shoulders,
+           hips: width multipliers (1 = average).
+    depth: also write a depth map (near = white). color_sides: tint the left side blue and the right side warm,
+           only to check left/right yourself (don't pass that render to generate_image).
+    save_to: main conversation only, when the user asks to keep a pose: saves it as a guide pose entry (mannequin
+             as its primary reference plus the pose itself, re-renderable from any view).
+    Works without a project. The files live in this session's folder until the session ends.
+    """
+render_pose = tool(render_pose)
 
 
 # ---------------------------------------------------------------- startup
