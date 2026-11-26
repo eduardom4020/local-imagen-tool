@@ -4,6 +4,7 @@
   python setup.py --check                  check prerequisites only (GPU, Docker + GPU access, uv)
   python setup.py                          full setup: config, Docker image, FLUX.2 klein model, start + verify
   python setup.py --models core extras     also download the comparison models (~26 GB more)
+                                           (default: core + control, the 92 MB depth LoRA for pose_mode='depth')
   python setup.py --external-url URL       use an existing ComfyUI instead of Docker (no build/start)
   python setup.py --home PATH              data folder (default ~/.local-imagen)
   python setup.py --blender-only           only build the Blender pose-renderer image (existing installs)
@@ -176,7 +177,7 @@ def main():
     ap.add_argument("--home", help="data folder (default: keep current, else ~/.local-imagen)")
     ap.add_argument("--docker-dir", help="where to put docker-compose.yml (default <home>/docker)")
     ap.add_argument("--external-url", help="use an existing ComfyUI at this URL instead of Docker")
-    ap.add_argument("--models", nargs="+", default=["core"], choices=["core", "extras"])
+    ap.add_argument("--models", nargs="+", default=["core", "control"], choices=["core", "control", "extras"])
     ap.add_argument("--force-copy", action="store_true", help="overwrite the Docker files in docker-dir")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-models", action="store_true")

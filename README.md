@@ -16,6 +16,8 @@ A Claude Code plugin that gives Claude its own image generator, running on your 
 - **Pose guides**: Blender draws a grey mannequin in the exact pose and camera angle. The picker uses it for
   action and acrobatic shots, so limbs stay in the right place. The pose comes from presets or joint angles, and
   you can save poses to the guide.
+- **Edits from red marks**: mark what's wrong in red on an image (even on a screenshot of a page) and only
+  that part is redrawn. The rest stays exactly as it was.
 - **Setup skill + script**: builds ComfyUI, downloads the model and checks that everything works on a new machine.
 
 ## Install (any machine)
@@ -84,6 +86,41 @@ All paths inside a project are relative, so a project folder works on any OS and
 - ComfyUI is stopped only when no other session is still using it. The Ollama models it unloaded are reloaded
   at that point.
 
+## Editing marked images
+
+To fix part of an image, mark it in red (for example with the pen in the Claude app's image editor), attach
+it, and say what to change. Claude edits only the marked areas and keeps the rest exactly as it was. It does
+not draw a new image.
+
+- **Marks:** `find_marks` finds the red marks. A loop marks what it encloses, and a scribble marks what it
+  covers.
+- **Finding the original:** it matches each mark to the original image it was drawn on, at full resolution.
+  That works even when you marked a screenshot of a page, such as a character-guide PDF with several images.
+  Originals are searched in the session's picks and the project's outputs, docs and guide references.
+- **The edit:** `edit_image` repaints each marked area in a crop around it at about 1 MP, so small things like
+  hands get detail. It pastes the result back with a soft edge.
+  - It makes candidates as usual, and the picker judges them on before/after crops.
+  - `approve_image` files the edited version next to the original.
+  - Use `strength` 1.0 to redraw anatomy or objects, or 0.4-0.7 for colour or detail changes.
+- **Attachment location:** Claude Code keeps chat attachments in `~/.claude/uploads`. `image="latest"` uses the
+  newest one.
+- **Green = where it should go.** Draw a green line next to a red mark to show the position and direction the
+  red-marked thing should have, for example where a sword should hang. A green loop moves it there without
+  turning it.
+  - It's a real redraw in two model steps, not a cut-and-paste:
+    1. **Remove:** the model takes the thing out and draws what was behind it, such as the belt, sash or
+       clothing.
+    2. **Put back:** the thing goes back on the green mark. The end nearer to the line keeps its place, such
+       as a hilt at the belt or a hand. The model redraws the whole connected region (for a sword at the
+       belt, the hips and belt) so it is attached and the picture makes sense.
+  - The model only ever sees clean pictures, because it copies its references almost pixel for pixel. Where
+    the old place was over plain background, it is restored to the exact background beforehand.
+  - Outside those areas nothing changes.
+  - Name the thing in the instruction and say how it attaches, for example "his sheathed sword, hanging from
+    his belt on a buckled strap".
+  - Two settings: `reach` (default 0.3) sets how much of the body around the attachment is redrawn, and
+    `redraw_strength` (default 0.9) sets how freely it is redrawn.
+
 ## Pose guides (Blender)
 
 Image models easily mix up limbs in action poses: crossed legs, doubled hands, odd arm angles. A pose guide
@@ -107,6 +144,14 @@ copies the pose of any full-body figure it is shown.
 - **Outputs:** a depth map on request, and the 2D joint positions in a JSON file.
 - **Keeping poses:** "Save this pose as *the draw*" stores it in the project guide as a pose entry. It can be
   re-rendered from any angle and used as `entries=["pose/the draw"]`.
+- **Depth mode:** `generate_image(pose=..., pose_mode="depth")` uses the
+  [RefControl depth LoRA](https://huggingface.co/thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora)
+  (Apache 2.0, 92 MB; `setup.py` downloads it).
+  - Image 1 is the pose's depth map (`render_pose(..., depth=True)`), and image 2 is the character's full
+    reference.
+  - It follows the silhouette even more tightly than the mannequin guide, and identity holds.
+  - In our tests, props such as a sheathed sword come out weaker. Use the default `guide` mode when props
+    matter.
 
 **Where Blender comes from:** a small Docker image, `docker/Dockerfile.blender`. It downloads the **official
 portable Linux build** of Blender (5.2 LTS) from download.blender.org and checks its SHA-256, so nothing is

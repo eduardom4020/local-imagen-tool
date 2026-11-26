@@ -23,7 +23,8 @@ Installing Docker, drivers, uv or Blender changes the system: ask the user befor
 2. Set up: run `python "<root>/scripts/setup.py"` in the background (15-30 min the first time; it prints `SETUP OK`
    at the end). Options:
    - `--home <folder>`: the data folder.
-   - `--models core extras`: also download the comparison models.
+   - `--models core control extras`: which model sets to download (default `core control`; `control` is the
+     92 MB depth LoRA for `pose_mode="depth"`, `extras` the comparison models).
    - `--skip-blender`: leave out the pose renderer.
    - `--external-url http://host:8188`: use an existing ComfyUI. Then put `flux-2-klein-4b.safetensors`,
      `qwen_3_4b_fp4_flux2.safetensors` and `flux2-vae.safetensors` from Comfy-Org/Flux-2-Klein-4B in its
@@ -75,6 +76,10 @@ pose guide with `generate_image(pose=...)`. Blender comes from one of two places
 - **Poses.** For action or acrobatic shots, tell the picker to use a pose guide (it renders and checks one itself).
   When the user wants to keep a pose, call `render_pose(..., save_to="<name>")` in the main conversation: it
   becomes a guide pose entry, usable as `entries=["pose/<name>"]`.
+- **Edits.** When the user attaches an image with red marks, edit it; don't redraw.
+  1. Call `find_marks("latest")` to see the numbered marks and their originals.
+  2. Delegate to the picker with the marked image's path and one instruction per mark. It calls `edit_image`.
+  3. A green line or loop next to a red mark means "put it here, this way". The picker moves it automatically.
 - **Switching projects** (`use_project`) drops the previous project's working state. Don't carry anything from it into
   new prompts.
 

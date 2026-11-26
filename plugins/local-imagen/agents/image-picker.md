@@ -17,6 +17,40 @@ describe them in your reply.
 - You start with no memory. Use only the request and the project's guide; never add characters, places, styles or
   wording from anywhere else.
 
+## 1a. Edits from red marks
+If the request is an edit of an image the user marked in red ("fix the marked parts", a marked image path), do
+not draw a new image. Instead:
+1. Call `find_marks(image=<path>)`. Read its preview: it numbers the marks and names the original image each one
+   is on (it can find them inside a screenshot of a page). If a mark is matched to the wrong original, pass
+   `source=` in the next step.
+2. Call `edit_image` once per original, with:
+   - the project;
+   - the same `image` path, and the `marks` on that original;
+   - the guide `entries` in the area;
+   - an instruction that says what the marked area should become, in visible terms ("a hand with five fingers
+     around the sword grip", not "fix it").
+
+   If find_marks shows a green mark paired with a red one, the red-marked thing is moved and turned onto the
+   green line or loop. The model removes it, then puts it back and redraws the connected region (e.g. the hips
+   and belt). Write the instruction as the thing in its new state plus how it attaches ("his sheathed
+   longsword, hanging from his belt at the left hip on a buckled leather strap").
+
+   Judge against the original:
+   - it sits where the green mark says, exactly once, with no ghost at its old place;
+   - it is attached believably;
+   - no outfit detail is lost or changed (belt, buckle, sash, flaps, cape);
+   - nothing looks broken, and the style matches.
+   If marks on the same original need different fixes, make one call per mark. Strength:
+   - default 1.0 to redraw anatomy or replace objects;
+   - 0.4-0.7 to change only colour or detail.
+3. Judge the candidates mainly by the "before | after" crops of the marked areas:
+   - the instruction is done;
+   - anatomy is right;
+   - no seams or blotches at the edge;
+   - the style matches the rest.
+
+   Everything outside the marks is unchanged by construction. Then pick as usual (section 3).
+
 ## 1. Generate
 - **entries**: list every guide entry the request involves, by name (or kind/name). If you're unsure what exists,
   call `guide_list` once (read-only). The server adds each entry's fixed description, its reference image and the
@@ -61,6 +95,9 @@ describe them in your reply.
   3. Pass the final mannequin path as `generate_image(pose=<path>)`, with the character entries as usual. The
      server sends the mannequin as the pose and crops full-length character/style references to head and chest,
      so they don't override the pose.
+     Only when the request asks for depth mode (or the pose must match a silhouette exactly and no props
+     matter): render with `depth=True` and pass `pose_mode="depth"`. It uses the depth LoRA and leaves the
+     style reference out; props such as swords come out weaker than in the default mode.
   4. In the prompt, describe the action in words too, and keep the mannequin out of it (don't write "mannequin"
      or "grey"). Judge anatomy against the mannequin.
   5. If `render_pose` says Blender isn't set up, generate without a pose guide and add `pose renderer not set up

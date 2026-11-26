@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=2.3,<3", "httpx>=0.27", "pillow>=10", "filelock>=3.13", "psutil>=5.9", "send2trash>=1.8"]
+# dependencies = ["mcp>=2.3,<3", "httpx>=0.27", "pillow>=10.1", "filelock>=3.13", "psutil>=5.9", "send2trash>=1.8",
+#                 "numpy>=1.26", "opencv-python-headless>=4.9"]
 # ///
 """local-imagen MCP server: local image generation (ComfyUI + FLUX.2 klein 4B) organised in game projects that
 carry a style guide (styles, characters, creatures, locations, props, poses, cameras...), plus detachable reference
@@ -37,6 +38,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import logging
 import os
 import random
@@ -167,8 +169,12 @@ MODEL = {  # FLUX.2 klein 4B (distilled, Apache 2.0)
     "unet": "flux-2-klein-4b.safetensors",
     "text_encoder": "qwen_3_4b_fp4_flux2.safetensors",
     "vae": "flux2-vae.safetensors",
+    # RefControl depth LoRA (Apache 2.0, thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora): used by
+    # generate_image(pose_mode="depth"); downloaded by setup.py --models control
+    "depth_lora": "flux2_klein_4b_refcontrol_depth.safetensors",
     **(CFG.get("model") or {}),
 }
+DEPTH_LORA_REPO = "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora"
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 ASPECTS = {
     "portrait": (896, 1152), "square": (1024, 1024), "landscape": (1152, 896),
@@ -897,7 +903,8 @@ async def upload_ref(c: httpx.AsyncClient, path: Path) -> str:
     return f"{j['subfolder']}/{j['name']}" if j.get("subfolder") else j["name"]
 
 
-def build_workflow(prompt: str, ref_names: list[str], w: int, h: int, seed: int, steps: int, ref_mp: float):
+def build_workflow(prompt: str, ref_names: list[str], w: int, h: int, seed: int, steps: int, ref_mp: float,
+                   lora: str | None = None, lora_strength: float = 1.0):
     wf = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL["unet"], "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL["text_encoder"], "type": "flux2",
@@ -921,13 +928,17 @@ def build_workflow(prompt: str, ref_names: list[str], w: int, h: int, seed: int,
         wf[str(b + 4)] = {"class_type": "ReferenceLatent", "inputs": {"conditioning": neg, "latent": [str(b + 2), 0]}}
         pos, neg = [str(b + 3), 0], [str(b + 4), 0]
     wf.update({
-        "10": {"class_type": "CFGGuider", "inputs": {"model": ["1", 0], "positive": pos, "negative": neg, "cfg": 1.0}},
+        "10": {"class_type": "CFGGuider", "inputs": {"model": ["20" if lora else "1", 0], "positive": pos,
+                                                     "negative": neg, "cfg": 1.0}},
         "11": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["10", 0],
                                                                   "sampler": ["9", 0], "sigmas": ["7", 0],
                                                                   "latent_image": ["6", 0]}},
         "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
         "13": {"class_type": "PreviewImage", "inputs": {"images": ["12", 0]}},
     })
+    if lora:
+        wf["20"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": lora,
+                                                                    "strength_model": lora_strength}}
     return wf
 
 
@@ -977,20 +988,37 @@ def _pose_ref(pose: str) -> dict:
     raise ValueError(f"pose '{pose}' is not an image file or a pose rendered in this session")
 
 
+def _depth_of(pose_r: dict) -> dict:
+    """The depth map rendered next to a render_pose mannequin (render_pose(..., depth=True))."""
+    p = Path(pose_r["path"])
+    d = p if p.stem.endswith("-depth") else p.with_name(f"{p.stem}-depth.png")
+    if not d.is_file():
+        raise ValueError(f"pose_mode='depth' needs the pose's depth map ({d.name}): render the pose with "
+                         "render_pose(..., depth=True) and pass that mannequin")
+    return {"path": d, "source": f"depth map {d.stem}",
+            "legend": "the depth map of the pose to use (near = bright): copy its pose, body proportions and "
+                      "camera angle"}
+
+
 def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_default_style: bool,
-          pose: str = "", pose_crop: bool = True) -> dict:
+          pose: str = "", pose_crop: bool = True, pose_mode: str = "guide") -> dict:
     """Compose the full prompt and pick the references (max 4) for one request in this session's context."""
     notes: list[str] = []
     pose_r = _pose_ref(pose) if pose.strip() else None
+    depth = pose_mode == "depth"
+    if depth:
+        if not pose_r:
+            raise ValueError("pose_mode='depth' needs pose=<a render_pose mannequin rendered with depth=True>")
+        pose_r = _depth_of(pose_r)
     if not S.get("project"):  # one-off images: the original behaviour
         if entry_names:
             raise ValueError("guide entries need a project; this session makes one-off images")
         refs = [{"path": LIB / r["file"], "source": f"attached '{r['label']}'"} for r in S["active"]] if use_refs else []
         if pose_r:  # say what each image is, so the pose guide isn't taken for a style reference
-            refs = (refs + [pose_r])[:MAX_REFS]
+            refs = ([pose_r] + refs if depth else refs + [pose_r])[:MAX_REFS]
             other = ROLE_TEXT["style"] if mode == "style" else "what the prompt describes"
             legend = " ".join(f"Image {i} shows {r.get('legend') or other}." for i, r in enumerate(refs, 1))
-            text = f"{prompt.strip()}\n\nReference images: {legend}"
+            text = ("refcontrol\n\n" if depth else "") + f"{prompt.strip()}\n\nReference images: {legend}"
         else:
             text = (STYLE_PREFIX + prompt) if refs and mode == "style" else prompt
         return {"text": text, "refs": refs, "entries": [], "checklist": [], "notes": notes, "project": None}
@@ -1032,10 +1060,15 @@ def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_de
             legend = ROLE_TEXT["style"] if mode == "style" else f"'{r['label']}' (use it as the prompt describes)"
             ranked.append((-1, {"path": LIB / r["file"], "legend": legend, "source": f"attached '{r['label']}'"}))
         if pose_r:
-            ranked.append((-0.5, pose_r))
+            ranked.append((-2 if depth else -0.5, pose_r))  # the depth LoRA expects the depth map as image 1
         posed = bool(pose_r) or any(e["kind"] == "pose" and _primary_ref(e) for e in chosen)
         for e in chosen:
             pr = _primary_ref(e)
+            if pr and depth and e["kind"] not in ("character", "creature"):
+                # the LoRA was trained on (depth, subject reference) pairs: other images only confuse it; the
+                # style still comes from the text and from the subject's own reference
+                notes.append(f"{_eid(e)}'s reference left out in depth mode (its description is kept)")
+                continue
             if pr:
                 legend = ROLE_TEXT.get(e["kind"], "{name}").format(name=e["name"])
                 if e["kind"] == "pose" and e.get("pose_spec"):
@@ -1044,7 +1077,7 @@ def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_de
                     legend += f" ({pr['role']})"
                 ref = {"path": e["_dir"] / pr["file"], "legend": legend, "source": _eid(e),
                        "file": (e["_dir"] / pr["file"]).relative_to(proj).as_posix()}
-                if posed and pose_crop and e["kind"] in ("character", "creature", "style"):
+                if posed and pose_crop and not depth and e["kind"] in ("character", "creature", "style"):
                     # a full-body figure in any reference overrides the pose guide: keep only its head and chest
                     crop = _head_chest_crop(ref["path"], f"{pr.get('label', '')} {pr.get('role', '')}")
                     if crop:
@@ -1063,7 +1096,7 @@ def _plan(prompt: str, entry_names: list[str], use_refs: bool, mode: str, use_de
         refs = refs[:MAX_REFS]
     legend = ("Reference images: " + " ".join(f"Image {i} shows {r['legend']}." for i, r in enumerate(refs, 1))
               if refs else "")
-    text = "\n\n".join(x for x in [prompt.strip(), *sections, legend] if x)
+    text = "\n\n".join(x for x in ["refcontrol" if depth else "", prompt.strip(), *sections, legend] if x)
 
     checklist = []
     for e in chosen:
@@ -1144,7 +1177,14 @@ mcp = MCPServer(
         "angle); the image-picker uses it for action and acrobatic poses via generate_image(pose=...). If it says "
         "Blender isn't set up, call setup_blender() (builds a small Docker image from the official Blender build) "
         "or, without Docker, setup_blender(path=<installed blender>); blender_status shows the state. When the "
-        "user wants to keep a pose, render_pose(..., save_to='<name>') saves it as a guide pose entry."
+        "user wants to keep a pose, render_pose(..., save_to='<name>') saves it as a guide pose entry.\n\n"
+        "EDITS FROM RED MARKS. When the user attaches an image with red marks (drawn with the Claude app's pen) "
+        "and asks for changes, edit only the marked areas, never draw a new image: call find_marks('latest') to "
+        "see the numbered marks and the original each is on, then delegate to the image-picker with the project, "
+        "the marked image's path, and one instruction per mark (it calls edit_image). A green line or loop next "
+        "to a red mark means: put the red-marked thing there, pointing that way (the model removes it and redraws "
+        "the connected region with it in place; name it and how it attaches in the instruction). Everything outside the marks stays as it was; approve_image files the edited "
+        "version."
     ),
 )
 
@@ -1572,11 +1612,33 @@ async def guide_remove_reference(name: str, reference: str) -> str:
 
 
 # ---- generation + review
+def _open_for_request(project: str):
+    """A subagent's request names its project: open it if this session has none, refuse a different one."""
+    want = project.strip()
+    if want:
+        if want.lower() in ("scratch", "none", "one-off", "no project"):
+            if S.get("project"):
+                raise ValueError(f"PROJECT_MISMATCH: this session is working on {_mode_text()}, not one-off "
+                                 "images. Only the main conversation switches (use_project), after the user asks.")
+            if not S.get("scratch"):
+                _switch_to(None, None, None, False, scratch=True)
+        else:
+            slug, path = _find_project(want)
+            if (S.get("project") and S["project"]["slug"] != slug) or S.get("scratch"):
+                raise ValueError(f"PROJECT_MISMATCH: this session is working on {_mode_text()}, not '{want}'. Only "
+                                 "the main conversation switches projects (use_project), after the user asks.")
+            if not S.get("project"):
+                _switch_to(slug, path, _read_json(path / "project.json"), False)
+    if not S.get("project") and not S.get("scratch"):
+        raise ValueError(NO_PROJECT)
+
+
 @tool
 async def generate_image(prompt: str, entries: list[str] | None = None, project: str = "", aspect: str = "portrait",
                          width: int = 0, height: int = 0, seed: int = -1, candidates: int = 0,
                          use_references: bool = True, reference_mode: str = "style", use_default_style: bool = True,
-                         pose: str = "", pose_crop: bool = True, steps: int = 4, preview_size: int = 512,
+                         pose: str = "", pose_crop: bool = True, pose_mode: str = "guide",
+                         lora_strength: float = 1.0, steps: int = 4, preview_size: int = 512,
                          dry_run: bool = False) -> list:
     """Render N candidate images for one request with FLUX.2 klein 4B (local ComfyUI). You then MUST call
     pick_candidate with the best one; only the picked image is presented to the user.
@@ -1597,29 +1659,17 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     pose: a pose guide that sets the body pose: a render_pose mannequin (its path or name), any pose image, or a
           guide pose entry. Full-length character, creature and style references are then cropped to head and
           chest (pose_crop=False keeps them whole), because a full-body figure makes the model copy its pose.
+    pose_mode: 'guide' (default) sends the grey mannequin as the pose reference. 'depth' uses the RefControl
+          depth LoRA instead: image 1 = the pose's depth map (render_pose(..., depth=True)), then the full
+          character/creature references (not cropped); other references are left out and the trigger word is
+          added. lora_strength: 0.8-1.0 (lower keeps more of the reference's look).
     Max 4 reference images per image: attached ones first, then the pose guide, characters/creatures, style,
     locations, props.
     dry_run: only return the composed prompt, references and checklist (nothing is rendered).
     Starts Docker/ComfyUI automatically if needed (and frees the GPU from Ollama).
     """
     global BUSY
-    want = project.strip()
-    if want:
-        if want.lower() in ("scratch", "none", "one-off", "no project"):
-            if S.get("project"):
-                raise ValueError(f"PROJECT_MISMATCH: this session is working on {_mode_text()}, not one-off "
-                                 "images. Only the main conversation switches (use_project), after the user asks.")
-            if not S.get("scratch"):
-                _switch_to(None, None, None, False, scratch=True)
-        else:
-            slug, path = _find_project(want)
-            if (S.get("project") and S["project"]["slug"] != slug) or S.get("scratch"):
-                raise ValueError(f"PROJECT_MISMATCH: this session is working on {_mode_text()}, not '{want}'. Only "
-                                 "the main conversation switches projects (use_project), after the user asks.")
-            if not S.get("project"):
-                _switch_to(slug, path, _read_json(path / "project.json"), False)
-    if not S.get("project") and not S.get("scratch"):
-        raise ValueError(NO_PROJECT)
+    _open_for_request(project)
     if width and height:
         w, h = width, height
     elif aspect in ASPECTS:
@@ -1629,7 +1679,11 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     w, h = (max(256, min(2048, v)) // 16 * 16 for v in (w, h))
     if reference_mode not in ("style", "edit"):
         raise ValueError("reference_mode must be 'style' or 'edit'")
-    plan = _plan(prompt, entries or [], use_references, reference_mode, use_default_style, pose, pose_crop)
+    if pose_mode not in ("guide", "depth"):
+        raise ValueError("pose_mode must be 'guide' or 'depth'")
+    plan = _plan(prompt, entries or [], use_references, reference_mode, use_default_style, pose, pose_crop,
+                 pose_mode)
+    lora = MODEL.get("depth_lora") if pose_mode == "depth" else None
     checklist = ("\nChecklist (judge the candidates against it):\n" + "\n".join(f"- {c}" for c in plan["checklist"])
                  if plan["checklist"] else "")
     ref_lines = "\n".join(f"  image {i}: {r['source']}" for i, r in enumerate(plan["refs"], 1)) or "  none"
@@ -1641,6 +1695,14 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     BUSY += 1
     try:
         startup = await _backend_ready()
+        if lora:
+            async with httpx.AsyncClient(timeout=30) as c:
+                info = (await c.get(f"{COMFY}/object_info/LoraLoaderModelOnly")).json()
+            have = info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0]
+            if lora not in have:
+                raise RuntimeError(f"the depth LoRA {lora} isn't installed in ComfyUI's models/loras: run "
+                                   "scripts/setup.py --skip-build --skip-blender --models control (or download it "
+                                   f"from huggingface.co/{DEPTH_LORA_REPO})")
         ref_mp = 1.0 if len(plan["refs"]) <= 2 else 0.6
         seed = random.randrange(2**31) if seed < 0 else seed
         rid = f"{dt.datetime.now():%m%d-%H%M%S}"
@@ -1655,7 +1717,8 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
             for i in range(1, n + 1):
                 s = seed + i - 1
                 t0 = time.monotonic()
-                png = await run_workflow(c, build_workflow(plan["text"], ref_names, w, h, s, steps, ref_mp))
+                png = await run_workflow(c, build_workflow(plan["text"], ref_names, w, h, s, steps, ref_mp,
+                                                           lora, lora_strength))
                 _write_bytes(rdir / f"cand_{i}.png", png)
                 cands.append({"number": i, "file": f"cand_{i}.png", "seed": s,
                               "seconds": round(time.monotonic() - t0, 1)})
@@ -1664,7 +1727,8 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
         BUSY -= 1
     meta = {"request_id": rid, "created": now_iso(), "project": plan["project"], "prompt": prompt,
             "full_prompt": plan["text"], "entries": plan["entries"], "checklist": plan["checklist"],
-            "width": w, "height": h, "steps": steps, "model": MODEL,
+            "width": w, "height": h, "steps": steps, "model": MODEL, "pose_mode": pose_mode if pose else None,
+            "lora": {"name": lora, "strength": lora_strength} if lora else None,
             "reference_mode": reference_mode if plan["refs"] else None,
             "references": [{"source": r["source"], **({"file": r["file"]} if r.get("file") else {})}
                            for r in plan["refs"]],
@@ -2507,6 +2571,856 @@ render_pose.__doc__ = f"""Render a pose guide: a plain grey artist's mannequin i
     Works without a project. The files live in this session's folder until the session ends.
     """
 render_pose = tool(render_pose)
+
+# ---------------------------------------------------------------- edits from red marks
+# The user marks what to change in red (e.g. with the pen of the Claude app's image editor) and attaches the
+# image. Marks are found, matched to the original image they were drawn on (also inside a screenshot of a page,
+# e.g. a guide PDF), and only the marked areas are repainted: each one in a crop around it at ~1 MP for detail,
+# then pasted back with a soft edge, so everything outside the marks stays exactly as it was.
+UPLOADS = Path.home() / ".claude" / "uploads"   # where Claude Code keeps images attached in chat
+EDIT_LEGEND = ("the picture being edited (a crop around the marked area): keep everything that is not asked to "
+               "change exactly as it is")
+
+
+def _latest_upload() -> Path:
+    files = [f for f in UPLOADS.glob("*/*") if f.suffix.lower() in IMG_EXT] if UPLOADS.is_dir() else []
+    if not files:
+        raise ValueError("no attached image found in ~/.claude/uploads; pass the marked image's file path")
+    return max(files, key=lambda f: f.stat().st_mtime)
+
+
+def _image_path(image: str) -> Path:
+    s = image.strip().strip('"')
+    if s.lower() in ("", "latest", "attached", "last"):
+        return _latest_upload()
+    if s in S["requests"] and (SEL / f"{s}.png").exists():
+        return SEL / f"{s}.png"
+    p = Path(s).expanduser()
+    if not p.is_file():
+        raise ValueError(f"image not found: {image}")
+    return p
+
+
+def _strokes(im, color: str):
+    """Pen strokes of one colour: 'red' = what to fix, 'green' = where/which way it should go."""
+    import numpy as np
+    a = np.asarray(im.convert("RGB")).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    if color == "red":
+        m = (r > 140) & (r - np.maximum(g, b) > 70)
+    else:
+        m = (g > 110) & (g - np.maximum(r, b) > 50)
+    return m.astype(np.uint8)
+
+
+def _red_regions(im):
+    """Numbered red marks (reading order) with a filled mask each: a loop marks what it encloses (its convex
+    hull), a scribble marks what it covers. A loop broken into pieces (drawn past the picture's edge, or with a
+    gap) counts as one mark."""
+    import cv2
+    import numpy as np
+    red = _strokes(im, "red")
+    H, W = red.shape
+    k = max(3, int(round(max(W, H) * 0.006)))
+    joined = cv2.dilate(red, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    pieces = []
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if area < W * H * 0.0003 or max(w, h) < max(W, H) * 0.02:
+            continue  # specks, JPEG noise
+        ys, xs = np.nonzero(lab == i)
+        pts = np.column_stack([xs, ys]).astype(np.int32)
+        edges = {}  # where the stroke leaves the picture: side -> (min, max) along that side
+        for side, sel, coord in (("left", xs <= 1, ys), ("right", xs >= W - 2, ys), ("top", ys <= 1, xs),
+                                 ("bottom", ys >= H - 2, xs)):
+            if sel.any():
+                edges[side] = (int(coord[sel].min()), int(coord[sel].max()))
+        pieces.append({"pts": pts, "edges": edges})
+
+    def hull_mask(pts):
+        m = np.zeros((H, W), np.uint8)
+        cv2.fillConvexPoly(m, cv2.convexHull(pts), 255)
+        return m
+
+    def same_loop(p, q) -> bool:
+        for side, (a0, a1) in p["edges"].items():
+            if side in q["edges"]:
+                b0, b1 = q["edges"][side]
+                if max(a0, b0) - min(a1, b1) < 0.25 * (H if side in ("left", "right") else W):
+                    return True  # both leave the same edge close together: the loop runs outside
+        mp, mq = hull_mask(p["pts"]) > 0, hull_mask(q["pts"]) > 0
+        return int((mp & mq).sum()) > 0.3 * min(int(mp.sum()), int(mq.sum()))
+
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(pieces)):
+            for j in range(i + 1, len(pieces)):
+                if same_loop(pieces[i], pieces[j]):
+                    p, q = pieces[i], pieces[j]
+                    edges = dict(p["edges"])
+                    for side, (b0, b1) in q["edges"].items():
+                        a0, a1 = edges.get(side, (b0, b1))
+                        edges[side] = (min(a0, b0), max(a1, b1))
+                    pieces[i] = {"pts": np.vstack([p["pts"], q["pts"]]), "edges": edges}
+                    del pieces[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    regions = []
+    for p in pieces:
+        mask = cv2.dilate(hull_mask(p["pts"]), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+        xs, ys = p["pts"][:, 0], p["pts"][:, 1]
+        regions.append({"mask": mask, "bbox": [int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1),
+                                               int(ys.max() - ys.min() + 1)],
+                        "center": (float(xs.mean()), float(ys.mean()))})
+    band = H * 0.08
+    regions.sort(key=lambda rg: (int(rg["center"][1] // band), rg["center"][0]))
+    for i, rg in enumerate(regions, 1):
+        rg["number"] = i
+    return regions, red
+
+
+def _green_marks(im) -> list[dict]:
+    """Green marks: a line (or arrow) = the new position and direction for what its red mark holds; a loop = the
+    new place only. Lettered A, B, ..."""
+    import cv2
+    import numpy as np
+    gm = _strokes(im, "green")
+    H, W = gm.shape
+    k = max(3, int(round(max(W, H) * 0.006)))
+    joined = cv2.dilate(gm, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    greens = []
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if area < W * H * 0.0002 or max(w, h) < max(W, H) * 0.02:
+            continue
+        ys, xs = np.nonzero((lab == i) & (gm > 0))
+        pts = np.column_stack([xs, ys]).astype(np.float64)
+        mean = pts.mean(axis=0)
+        evals, evecs = np.linalg.eigh(np.cov((pts - mean).T))
+        axis = evecs[:, int(np.argmax(evals))]
+        elong = math.sqrt(max(evals) / max(1e-6, min(evals)))
+        proj = (pts - mean) @ axis
+        g = {"bbox": [x, y, w, h], "center": (float(mean[0]), float(mean[1])),
+             "shape": "line" if elong > 3.0 else "loop",
+             "ends": [(mean + axis * proj.min()).tolist(), (mean + axis * proj.max()).tolist()],
+             "pts": pts[:: max(1, len(pts) // 400)]}
+        greens.append(g)
+    greens.sort(key=lambda g: (g["center"][1], g["center"][0]))
+    for i, g in enumerate(greens):
+        g["letter"] = chr(ord("A") + i)
+    return greens
+
+
+def _edit_candidates() -> list[Path]:
+    """Images a mark may have been drawn on: this session's picks, then the open project's outputs, documents
+    (e.g. guide PDFs' images) and guide references (newest first), or the one-off outputs."""
+    found = list(SEL.glob("*.png")) if SEL.is_dir() else []
+    if S.get("project"):
+        proj, _ = current()
+        for pattern in ("outputs/*/*.png", "docs/**/*.png", "guide/*/*/refs/*.png"):
+            found += sorted(proj.glob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)[:300]
+    elif OUT.is_dir():
+        found += sorted(OUT.glob("*/*.png"), key=lambda f: f.stat().st_mtime, reverse=True)[:300]
+    seen, out = set(), []
+    for f in found:
+        k = _norm(f)
+        if k not in seen and "previews" not in f.parts and "build" not in f.parts:
+            seen.add(k)
+            out.append(f)
+    return out
+
+
+def _source_rank(p: Path) -> int:
+    parts = [x.lower() for x in p.parts]
+    return 0 if "selected" in parts else 1 if "outputs" in parts else 2 if "refs" in parts else 3
+
+
+def _locate_sources(marked, red, cands: list[Path]) -> list[dict]:
+    """Where each candidate original appears in the marked image (SIFT + RANSAC similarity transform), so a mark
+    can be mapped back onto the original's own pixels, even from a scaled or cropped screenshot."""
+    import cv2
+    import numpy as np
+    g2 = cv2.cvtColor(np.asarray(marked.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    pen = np.maximum(red, _strokes(marked, "green"))
+    keep = 255 - cv2.dilate(pen * 255, np.ones((9, 9), np.uint8))   # no features on the pen strokes
+    kp2, d2 = cv2.SIFT_create(nfeatures=8000).detectAndCompute(g2, keep)
+    if d2 is None or len(kp2) < 20:
+        return []
+    sift = cv2.SIFT_create(nfeatures=1500)
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+    thr = max(3.0, 0.006 * max(marked.size))
+    found = []
+    for p in cands:
+        try:
+            im = PILImage.open(p).convert("RGB")
+        except OSError:
+            continue
+        sc = min(1.0, 720 / max(im.size))
+        small = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), PILImage.LANCZOS)
+        kp1, d1 = sift.detectAndCompute(cv2.cvtColor(np.asarray(small), cv2.COLOR_RGB2GRAY), None)
+        if d1 is None or len(kp1) < 12:
+            continue
+        good = [m for m, n2 in (x for x in bf.knnMatch(d1, d2, k=2) if len(x) == 2) if m.distance < 0.75 * n2.distance]
+        if len(good) < 12:
+            continue
+        src = np.float32([kp1[m.queryIdx].pt for m in good]) / sc
+        dst = np.float32([kp2[m.trainIdx].pt for m in good])
+        A, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=thr)
+        if A is None or inl is None:
+            continue
+        n_in, scale = int(inl.sum()), float(np.hypot(A[0, 0], A[1, 0]))
+        if n_in < 15 or not 0.03 < scale < 30:
+            continue
+        w, h = im.size
+        corners = A @ np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], np.float64).T
+        found.append({"path": p, "A": A, "inliers": n_in, "scale": scale, "size": (w, h),
+                      "box": [float(corners[0].min()), float(corners[1].min()), float(corners[0].max()),
+                              float(corners[1].max())]})
+    return found
+
+
+def _mark_diff(marked, pen, region_mask, src: dict) -> float:
+    """How different a candidate original is from the marked picture in and around one mark (pen strokes left
+    out): mean absolute grey difference after mapping the candidate onto the marked picture."""
+    import cv2
+    import numpy as np
+    W, H = marked.size
+    cand = np.asarray(PILImage.open(src["path"]).convert("L"))
+    warped = cv2.warpAffine(cand, src["A"], (W, H), flags=cv2.INTER_AREA, borderValue=0)
+    inside = cv2.warpAffine(np.full(cand.shape, 255, np.uint8), src["A"], (W, H), flags=cv2.INTER_NEAREST)
+    area = cv2.dilate(region_mask, np.ones((25, 25), np.uint8)) > 0
+    sel = area & (cv2.dilate(pen, np.ones((7, 7), np.uint8)) == 0) & (inside > 0)
+    if not sel.any():
+        return 0.0
+    g = cv2.GaussianBlur(np.asarray(marked.convert("L")), (3, 3), 0).astype(np.float32)
+    w = cv2.GaussianBlur(warped, (3, 3), 0).astype(np.float32)
+    return float(np.abs(g[sel] - w[sel]).mean())
+
+
+def _analyze_marks(image: str) -> dict:
+    import numpy as np
+    marked_p = _image_path(image)
+    marked = PILImage.open(marked_p).convert("RGB")
+    regions, red = _red_regions(marked)
+    if not regions:
+        raise ValueError(f"no red marks found on {marked_p.name}. Mark the areas to change in bright red "
+                         "(a loop around each one, or a scribble over it)")
+    sources = _locate_sources(marked, red, _edit_candidates())
+    pen = np.maximum(red, _strokes(marked, "green"))
+    for rg in regions:
+        cx, cy = rg["center"]
+        inside = [s for s in sources if s["box"][0] <= cx <= s["box"][2] and s["box"][1] <= cy <= s["box"][3]]
+        if inside:
+            best = max(s["inliers"] for s in inside)
+            close = [s for s in inside if s["inliers"] >= 0.85 * best]
+            if len(close) > 1:  # versions of one picture (an original and its edits, copies): the one whose
+                for s in close:  # pixels in and around the mark match what the user drew on wins
+                    s["_diff"] = _mark_diff(marked, pen, rg["mask"], s)
+                lo = min(s["_diff"] for s in close)
+                close = [s for s in close if s["_diff"] <= lo + 2.0]
+            rg["source"] = min(close, key=lambda s: (_source_rank(s["path"]), -s["inliers"]))
+        else:
+            rg["source"] = None
+        rg["green"] = None
+    greens = _green_marks(marked)
+    if greens:
+        import cv2
+        import numpy as np
+        for g in greens:  # each green mark belongs to the nearest red mark
+            best = None
+            for rg in regions:
+                dist = cv2.distanceTransform(255 - rg["mask"], cv2.DIST_L2, 3)
+                pts = g["pts"].astype(int)
+                dmin = float(dist[np.clip(pts[:, 1], 0, dist.shape[0] - 1), np.clip(pts[:, 0], 0, dist.shape[1] - 1)].min())
+                if best is None or dmin < best[0]:
+                    best = (dmin, rg)
+            g["red"] = best[1]["number"]
+            if best[1]["green"] is None or best[0] < best[1]["green"]["_d"]:
+                g["_d"] = best[0]
+                best[1]["green"] = g
+    return {"marked_path": marked_p, "marked": marked, "regions": regions, "greens": greens}
+
+
+def _mark_preview(an: dict, size: int):
+    from PIL import ImageDraw
+    im = an["marked"].copy()
+    d = ImageDraw.Draw(im)
+    fs = max(14, int(max(im.size) * 0.03))
+    for rg in an["regions"]:
+        x, y, w, h = rg["bbox"]
+        d.rectangle([x, y, x + w, y + h], outline=(30, 90, 220), width=max(2, fs // 8))
+        d.rectangle([x, y - fs - 4, x + fs * 1.4, y], fill=(30, 90, 220))
+        d.text((x + 4, y - fs - 2), str(rg["number"]), fill=(255, 255, 255), font_size=fs)
+    for g in an.get("greens") or []:
+        (ax, ay), (bx, by) = g["ends"]
+        if g["shape"] == "line":
+            d.line([ax, ay, bx, by], fill=(250, 170, 0), width=max(2, fs // 6))
+        x, y, w, h = g["bbox"]
+        d.rectangle([x + w, y + h, x + w + fs * 1.4, y + h + fs + 4], fill=(20, 140, 60))
+        d.text((x + w + 4, y + h + 2), g["letter"], fill=(255, 255, 255), font_size=fs)
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return _preview(buf.getvalue(), size)
+
+
+def _source_mask(rg: dict, src: dict, w: int, h: int):
+    """The mark's mask in the original image's own pixels."""
+    import cv2
+    if src is None:
+        return rg["mask"]
+    inv = cv2.invertAffineTransform(src["A"])
+    m = cv2.warpAffine(rg["mask"], inv, (w, h), flags=cv2.INTER_NEAREST)
+    return (m > 127).astype("uint8") * 255
+
+
+def _clean_red(img):
+    """Inpaint the pen strokes (red and green) out of an image that is itself the marked one (no original)."""
+    import cv2
+    import numpy as np
+    a = np.asarray(img.convert("RGB"))
+    pen = np.maximum(_strokes(img, "red"), _strokes(img, "green")) * 255
+    pen = cv2.dilate(pen, np.ones((5, 5), np.uint8))
+    return PILImage.fromarray(cv2.inpaint(a, pen, 5, cv2.INPAINT_TELEA))
+
+
+def _green_to_source(g: dict, src: dict | None) -> dict:
+    """A green mark's line ends / centre in the original image's pixels."""
+    import cv2
+    import numpy as np
+    if src is None:
+        return {**g}
+    inv = cv2.invertAffineTransform(src["A"])
+
+    def tf(p):
+        v = inv @ np.array([p[0], p[1], 1.0])
+        return [float(v[0]), float(v[1])]
+    return {**g, "ends": [tf(g["ends"][0]), tf(g["ends"][1])], "center": tuple(tf(g["center"]))}
+
+
+def _direction_words(v) -> str:
+    """A direction on the picture in words (for the prompt; the image model also gets it drawn)."""
+    dx, dy = float(v[0]), float(v[1])
+    ang = math.degrees(math.atan2(dx, dy))   # 0 = straight down, + = toward the right of the picture
+    side = "right" if dx > 0 else "left"
+    a = abs(ang)
+    if a <= 12:
+        return "pointing straight down"
+    if a <= 35:
+        return f"pointing down, tilted slightly toward the {side} side of the picture"
+    if a <= 60:
+        return f"pointing diagonally down toward the {side} side of the picture"
+    if a <= 120:
+        return f"pointing sideways toward the {side} side of the picture"
+    if a <= 150:
+        return f"pointing diagonally up toward the {side} side of the picture"
+    return "pointing up"
+
+
+def _move_layers(img, red_mask, green: dict, reach: float) -> dict:
+    """Plan a move as two model steps. The red-marked thing is cut out and turned/moved onto the green mark (a
+    line: lie along it, the nearer ends kept together, e.g. a hilt at the belt; a loop: centre on it). Returns:
+      remove  where step 1 repaints: the thing's old place and where it attached (the model removes it and
+              draws what was behind it, e.g. the belt, sash and clothing)
+      layer   the thing alone on white at its new position and angle (step 2's image 2), and moved/put, its
+              pixels there
+      region  where step 2 redraws: the old place, the new place and everything around where it attaches (e.g.
+              the whole hip for a sword at the belt), so it is put back attached and the picture makes sense
+      words   the new direction in words; info  what was done.
+    The model copies reference pictures almost pixel for pixel, so both steps only ever show it clean, sharp
+    pictures: never a hand-made cut-out with gaps or smudges."""
+    import cv2
+    import numpy as np
+    a = np.asarray(img.convert("RGB"))
+    H, W = red_mask.shape
+    R = red_mask > 127
+    ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    ring = (cv2.dilate(red_mask, ell, iterations=2) > 127) & ~R
+    bg = np.median(a[ring], axis=0) if ring.any() else np.array([255, 255, 255])
+    diff = np.abs(a.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
+    # the marked thing: its solid body (clearly darker or more coloured than the background, thicker than an
+    # outline), the largest such piece, plus its own edges; pale fabric or outlines next to it stay where they are
+    core = ((diff > 60) & R).astype(np.uint8) * 255
+    core = cv2.morphologyEx(core, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+    if n_c > 1:   # the largest piece, plus pieces of it split off (e.g. a scabbard's metal tip): big or close
+        big = 1 + int(np.argmax(st_c[1:, cv2.CC_STAT_AREA]))
+        span = max(int(st_c[big, cv2.CC_STAT_WIDTH]), int(st_c[big, cv2.CC_STAT_HEIGHT]))
+        reach_big = cv2.dilate((lab_c == big).astype(np.uint8),
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(5, span // 12) + 1,) * 2)) > 0
+        keep = [i for i in range(1, n_c) if st_c[i, cv2.CC_STAT_AREA] >= 0.15 * st_c[big, cv2.CC_STAT_AREA]
+                or (st_c[i, cv2.CC_STAT_AREA] >= 0.005 * st_c[big, cv2.CC_STAT_AREA] and (reach_big & (lab_c == i)).any())]
+        core = np.isin(lab_c, keep).astype(np.uint8) * 255
+    cand = (diff > 28) & R
+    near_core = cv2.dilate(core, np.ones((9, 9), np.uint8)) > 0
+    if core.any():  # plus whatever lies on its own axis, within its width, up to just past its ends (a pale tip)
+        cy, cx = np.nonzero(core)
+        cp = np.column_stack([cx, cy]).astype(np.float64)
+        cm = cp.mean(axis=0)
+        ev, evec = np.linalg.eigh(np.cov((cp - cm).T))
+        ax, nrm = evec[:, int(np.argmax(ev))], evec[:, int(np.argmin(ev))]
+        along, across = (cp - cm) @ ax, np.abs((cp - cm) @ nrm)
+        lo_a, hi_a = along.min(), along.max()
+        pad_a, half_w = 0.08 * (hi_a - lo_a), np.percentile(across, 90) * 1.4 + 3
+        yy, xx = np.nonzero(cand)
+        q = np.column_stack([xx, yy]).astype(np.float64) - cm
+        on_axis = ((q @ ax >= lo_a - pad_a) & (q @ ax <= hi_a + pad_a) & (np.abs(q @ nrm) <= half_w))
+        band = np.zeros_like(cand)
+        band[yy[on_axis], xx[on_axis]] = True
+        near_core |= band
+    obj = (cand & near_core).astype(np.uint8) * 255
+    obj = cv2.morphologyEx(obj, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    if not obj.any():
+        obj = ((diff > 28) & R).astype(np.uint8) * 255
+    if not obj.any():
+        obj = red_mask.copy()
+    ys, xs = np.nonzero(obj)
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    mean = pts.mean(axis=0)
+    evals, evecs = np.linalg.eigh(np.cov((pts - mean).T))
+    axis = evecs[:, int(np.argmax(evals))]
+    proj = (pts - mean) @ axis
+    ea, eb = mean + axis * proj.min(), mean + axis * proj.max()
+    if green["shape"] == "line":
+        g1, g2 = np.array(green["ends"][0]), np.array(green["ends"][1])
+        if np.linalg.norm(ea - g1) + np.linalg.norm(eb - g2) > np.linalg.norm(ea - g2) + np.linalg.norm(eb - g1):
+            g1, g2 = g2, g1
+        ang = math.atan2(*(g2 - g1)[::-1]) - math.atan2(*(eb - ea)[::-1])
+        ang = (ang + math.pi) % (2 * math.pi) - math.pi
+        pivot, dest = ea, g1
+        words = _direction_words(g2 - g1)
+    else:
+        ang, pivot, dest = 0.0, mean, np.array(green["center"])
+        words = "moved to its new place"
+    c_, s_ = math.cos(ang), math.sin(ang)
+    rot = np.array([[c_, -s_], [s_, c_]])
+    t = dest - rot @ pivot
+    M = np.array([[c_, -s_, t[0]], [s_, c_, t[1]]], np.float64)
+    moved = cv2.warpAffine(a, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    moved_obj = cv2.warpAffine(obj, M, (W, H), flags=cv2.INTER_NEAREST)
+    put = moved_obj > 127
+    length = float(np.linalg.norm(eb - ea)) or 50.0
+
+    # step 1 (remove): where the old place is over plain background it is cleared here, exactly (the model
+    # copies its reference, so a visible old thing there could come back); the model removes the rest
+    hole = cv2.dilate(obj, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 127
+    body = ((diff > 28) & ~(obj > 127)).astype(np.uint8)
+    nb, blab, bstats, _ = cv2.connectedComponentsWithStats(body, connectivity=8)
+    for i in range(1, nb):   # specks along the old edge are not clothing
+        if bstats[i, cv2.CC_STAT_AREA] < 60:
+            body[blab == i] = 0
+    near = max(15, int(max(H, W) * 0.025))
+    body_zone = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * near + 1,) * 2)) > 0
+    start = a.copy()
+    ring_flat = ring & (diff < 12)
+    if bool(ring_flat.sum() > 0.4 * max(1, ring.sum())) and float(a[ring_flat].std(axis=0).max()) < 4:
+        start[hole & ~body_zone] = bg.astype(np.uint8)
+        remove = (hole & body_zone).astype(np.uint8) * 255
+    else:
+        remove = hole.astype(np.uint8) * 255
+    cv2.circle(remove, (int(pivot[0]), int(pivot[1])), max(16, int(length * 0.15)), 255, -1)
+    layer = np.full_like(a, 255)
+    layer[put] = moved[put]
+
+    # the region to redraw: the old place, the new place and everything near the attachments
+    region = R.astype(np.uint8) * 255
+    region = np.maximum(region, cv2.dilate(moved_obj, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * max(5, int(length * 0.08)) + 1,) * 2)))
+    r_reach = max(24, int(length * max(0.1, reach)))
+    for pt in (dest, pivot):
+        cv2.circle(region, (int(pt[0]), int(pt[1])), r_reach, 255, -1)
+    k = max(9, int(length * 0.15)) | 1
+    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    info = f"turned {math.degrees(ang):+.0f} degrees, moved {np.linalg.norm(dest - pivot):.0f} px"
+    return {"start": PILImage.fromarray(start), "remove": remove, "layer": PILImage.fromarray(layer),
+            "moved": moved, "put": put, "region": region, "words": words, "info": info}
+
+
+async def _redraw_once(c: httpx.AsyncClient, base, mv: dict, text: str, seed: int, steps: int, strength: float):
+    """Step 2 of a move: base is the clean picture from step 1 (the thing removed). Redraw the region starting from
+    base with the thing pasted at its new place; image 1 = base, image 2 = the thing alone in place. Pasted back
+    over base with a soft edge."""
+    import numpy as np
+    start = np.asarray(base.convert("RGB")).copy()
+    start[mv["put"]] = mv["moved"][mv["put"]]
+    mv = {**mv, "collage": PILImage.fromarray(start), "plate": base}
+    import cv2
+    import numpy as np
+    W, H = base.size
+    region = mv["region"]
+    x0, y0, x1, y1 = _edit_box(region, W, H)
+    bw, bh = x1 - x0, y1 - y0
+    sc = math.sqrt(1.05e6 / (bw * bh))
+    cw, ch = (max(256, min(2048, int(round(v * sc / 16)) * 16)) for v in (bw, bh))
+    rg = region[y0:y1, x0:x1]
+    d = max(3, int(max(bw, bh) * 0.015))
+    sample_m = (cv2.GaussianBlur(cv2.dilate(rg, np.ones((2 * d + 1,) * 2, np.uint8)), (0, 0), d)
+                .astype(np.float32) * max(0.2, min(1.0, strength))).astype(np.uint8)
+    comp_m = cv2.GaussianBlur(rg, (0, 0), d)
+
+    def up(img) -> bytes:
+        buf = io.BytesIO()
+        img.crop((x0, y0, x1, y1)).resize((cw, ch), PILImage.LANCZOS).save(buf, "PNG")
+        return buf.getvalue()
+    mbuf = io.BytesIO()
+    PILImage.fromarray(sample_m).resize((cw, ch), PILImage.BILINEAR).convert("RGB").save(mbuf, "PNG")
+    names = []
+    for data in (up(mv["collage"]), mbuf.getvalue(), up(mv["plate"]), up(mv["layer"])):
+        name = hashlib.sha1(data).hexdigest()[:12] + ".png"
+        r = await c.post(f"{COMFY}/upload/image", files={"image": (name, data, "image/png")},
+                         data={"type": "input", "subfolder": "mcp_refs", "overwrite": "true"})
+        r.raise_for_status()
+        j = r.json()
+        names.append(f"{j['subfolder']}/{j['name']}" if j.get("subfolder") else j["name"])
+    out = await run_workflow(c, build_edit_workflow(text, names[0], names[1], [names[3]], cw, ch, seed, steps, 1.0,
+                                                    context_name=names[2]))
+    new = PILImage.open(io.BytesIO(out)).convert("RGB").resize((bw, bh), PILImage.LANCZOS)
+    crop = base.crop((x0, y0, x1, y1))
+    result = base.copy()
+    result.paste(PILImage.composite(new, crop, PILImage.fromarray(comp_m)), (x0, y0))
+    return result, (x0, y0, x1, y1)
+
+
+def build_edit_workflow(prompt: str, img_name: str, mask_name: str, ref_names: list[str], w: int, h: int,
+                        seed: int, steps: int, strength: float, context_name: str | None = None,
+                        no_context: bool = False):
+    total = steps if strength >= 0.999 else max(steps + 1, int(math.ceil(steps / max(0.05, strength))))
+    wf = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": MODEL["text_encoder"], "type": "flux2",
+                                                      "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": MODEL["vae"]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+        "7": {"class_type": "Flux2Scheduler", "inputs": {"steps": total, "width": w, "height": h}},
+        "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "9": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "21": {"class_type": "DifferentialDiffusion", "inputs": {"model": ["1", 0]}},
+        "30": {"class_type": "LoadImage", "inputs": {"image": img_name}},
+        "31": {"class_type": "VAEEncode", "inputs": {"pixels": ["30", 0], "vae": ["3", 0]}},
+        "32": {"class_type": "LoadImageMask", "inputs": {"image": mask_name, "channel": "red"}},
+        "33": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["31", 0], "mask": ["32", 0]}},
+    }
+    pos, neg = ["4", 0], ["5", 0]
+    images = ref_names if no_context else [context_name or img_name, *ref_names]
+    for i, name in enumerate(images):   # image 1 = the picture, as context (unless no_context: plain inpainting)
+        b = 100 + i * 10
+        wf[str(b)] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        wf[str(b + 1)] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
+            "image": [str(b), 0], "upscale_method": "nearest-exact", "megapixels": 1.0 if i == 0 else 0.6,
+            "resolution_steps": 1}}
+        wf[str(b + 2)] = {"class_type": "VAEEncode", "inputs": {"pixels": [str(b + 1), 0], "vae": ["3", 0]}}
+        wf[str(b + 3)] = {"class_type": "ReferenceLatent", "inputs": {"conditioning": pos, "latent": [str(b + 2), 0]}}
+        wf[str(b + 4)] = {"class_type": "ReferenceLatent", "inputs": {"conditioning": neg, "latent": [str(b + 2), 0]}}
+        pos, neg = [str(b + 3), 0], [str(b + 4), 0]
+    sig = ["7", 0]
+    if total > steps:
+        wf["40"] = {"class_type": "SplitSigmas", "inputs": {"sigmas": ["7", 0], "step": total - steps}}
+        sig = ["40", 1]
+    wf.update({
+        "10": {"class_type": "CFGGuider", "inputs": {"model": ["21", 0], "positive": pos, "negative": neg, "cfg": 1.0}},
+        "11": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["10", 0],
+                                                                  "sampler": ["9", 0], "sigmas": sig,
+                                                                  "latent_image": ["33", 0]}},
+        "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+        "13": {"class_type": "PreviewImage", "inputs": {"images": ["12", 0]}},
+    })
+    return wf
+
+
+def _edit_box(mask, W: int, H: int) -> tuple[int, int, int, int]:
+    import numpy as np
+    ys, xs = np.nonzero(mask > 0)
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()) + 1, int(ys.min()), int(ys.max()) + 1
+    pad = int(max(x1 - x0, y1 - y0) * 0.6) + 24
+    x0, y0, x1, y1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
+    for _ in range(2):  # at least ~384 px of context each way
+        if x1 - x0 < 384:
+            c = (x0 + x1) // 2
+            x0, x1 = c - 192, c + 192
+        if y1 - y0 < 384:
+            c = (y0 + y1) // 2
+            y0, y1 = c - 192, c + 192
+    if x0 < 0:
+        x1, x0 = x1 - x0, 0
+    if y0 < 0:
+        y1, y0 = y1 - y0, 0
+    return max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+
+
+async def _edit_once(c: httpx.AsyncClient, base, mask, text: str, ref_names: list[str], seed: int, steps: int,
+                     strength: float, before=None, redraw=None, no_context: bool = False):
+    """Repaint one marked area of base (PIL RGB); returns the new full image and the area's box. The mask's grey
+    levels say how much each pixel may change (differential diffusion). redraw: areas (uint8 mask) that are
+    blurred in the image-1 reference, because the model copies a sharp reference pixel for pixel (a rough
+    collage's seams would come back); the picture being edited stays sharp. before: the picture before a move,
+    sent as image 2 so the moved thing keeps its design."""
+    import cv2
+    import numpy as np
+    W, H = base.size
+    x0, y0, x1, y1 = _edit_box(mask, W, H)
+    bw, bh = x1 - x0, y1 - y0
+    s = math.sqrt(1.05e6 / (bw * bh))
+    cw, ch = (max(256, min(2048, int(round(v * s / 16)) * 16)) for v in (bw, bh))
+    crop = base.crop((x0, y0, x1, y1))
+    m = mask[y0:y1, x0:x1]
+    d = max(3, int(max(bw, bh) * 0.02))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))
+    if len(np.unique(m)) > 2:   # graded (a move): soften only, so low "keep it empty" zones stay low
+        sample_m = cv2.GaussianBlur(m, (0, 0), max(1.0, d / 3))
+    else:                       # a plain mark: let the model paint a little past it, for a clean edge
+        sample_m = cv2.GaussianBlur(cv2.dilate(m, k, iterations=2), (0, 0), d / 2)
+    comp_m = cv2.GaussianBlur(cv2.dilate((m > 0).astype(np.uint8) * 255, k), (0, 0), d / 2)  # pasted back
+
+    def png(img) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+    crop_big = crop.resize((cw, ch), PILImage.LANCZOS)
+    mask_big = PILImage.fromarray(sample_m).resize((cw, ch), PILImage.BILINEAR).convert("RGB")
+    names = []
+    imgs = [png(crop_big), png(mask_big)]
+    context = None
+    if redraw is not None and redraw[y0:y1, x0:x1].any():
+        rz = cv2.GaussianBlur(cv2.dilate(redraw[y0:y1, x0:x1], k), (0, 0), d / 2)
+        rz = np.asarray(PILImage.fromarray(rz).resize((cw, ch), PILImage.BILINEAR), np.float32)[..., None] / 255
+        sharp = np.asarray(crop_big, np.float32)
+        soft = cv2.GaussianBlur(sharp, (0, 0), max(4.0, min(cw, ch) * 0.02))
+        context = PILImage.fromarray((sharp * (1 - rz) + soft * rz).clip(0, 255).astype(np.uint8))
+        imgs.append(png(context))
+    if before is not None:
+        imgs.append(png(before.crop((x0, y0, x1, y1)).resize((cw, ch), PILImage.LANCZOS)))
+    for data in imgs:
+        name = hashlib.sha1(data).hexdigest()[:12] + ".png"
+        r = await c.post(f"{COMFY}/upload/image", files={"image": (name, data, "image/png")},
+                         data={"type": "input", "subfolder": "mcp_refs", "overwrite": "true"})
+        r.raise_for_status()
+        j = r.json()
+        names.append(f"{j['subfolder']}/{j['name']}" if j.get("subfolder") else j["name"])
+    ctx_name = names[2] if context is not None else None
+    extra = names[3:] if context is not None else names[2:]
+    out = await run_workflow(c, build_edit_workflow(text, names[0], names[1], extra + ref_names, cw, ch, seed,
+                                                    steps, strength, ctx_name, no_context))
+    new = PILImage.open(io.BytesIO(out)).convert("RGB").resize((bw, bh), PILImage.LANCZOS)
+    pasted = PILImage.composite(new, crop, PILImage.fromarray(comp_m))
+    result = base.copy()
+    result.paste(pasted, (x0, y0))
+    return result, (x0, y0, x1, y1)
+
+
+@tool
+async def find_marks(image: str = "latest", preview_size: int = 900) -> list:
+    """Find the red marks on an image the user marked up (e.g. with the pen of the Claude app's image editor) and
+    the original image each mark was drawn on. Green marks next to a red mark show where and which way the red-
+    marked thing should go (a line = position and direction, a loop = position). image: a file path, or 'latest' = the newest image attached in a
+    Claude chat on this computer (~/.claude/uploads). Originals are searched in this session's picks and the open
+    project's outputs, docs (e.g. a guide PDF's images) and guide references, also inside a screenshot of a page.
+    Returns the numbered marks and a preview with the numbers, to match the user's notes to marks before
+    edit_image."""
+    an = await asyncio.to_thread(_analyze_marks, image)
+    lines = [f"Marked image: {an['marked_path']} ({an['marked'].width}x{an['marked'].height}), "
+             f"{len(an['regions'])} mark(s):"]
+    for rg in an["regions"]:
+        src = rg["source"]
+        x, y, w, h = rg["bbox"]
+        where = (f"on {src['path']} ({src['inliers']} matching points; the attached picture shows it at "
+                 f"{src['scale'] * 100:.0f}% size)") if src else "no original found: the attached image itself is edited"
+        lines.append(f"  mark {rg['number']}: at x {x}-{x + w}, y {y}-{y + h} of the attached image, {where}")
+        if rg.get("green"):
+            g = rg["green"]
+            what = ("a line: the marked thing will be turned and moved to lie along it" if g["shape"] == "line"
+                    else "a loop: the marked thing will be moved there")
+            lines.append(f"    + green mark {g['letter']} ({what})")
+    unused = [g["letter"] for g in an.get("greens") or [] if all(rg.get("green") is not g for rg in an["regions"])]
+    if unused:
+        lines.append(f"  green mark(s) {', '.join(unused)} not used (another green mark is closer to the same red mark)")
+    lines.append("Next: edit_image(instruction=..., image=<same>, marks=[numbers on one original]) per original; "
+                 "write one instruction per mark when the user's notes differ. A red mark with a green partner is "
+                 "moved/turned onto the green mark first (the instruction may then be empty).")
+    return ["\n".join(lines), _mark_preview(an, preview_size)]
+
+
+@tool
+async def edit_image(instruction: str = "", image: str = "latest", marks: list[int] | None = None,
+                     source: str = "", entries: list[str] | None = None, project: str = "", strength: float = 1.0,
+                     redraw_strength: float = 0.9, reach: float = 0.3, candidates: int = 0, seed: int = -1,
+                     steps: int = 4, preview_size: int = 512) -> list:
+    """Edit ONLY the areas the user marked in red, instead of drawing a new image: everything outside the marks
+    stays exactly as it was. Renders N candidates like generate_image: then pick_candidate and approve_image.
+
+    instruction: what to change inside the marks, e.g. "fix the hand: five fingers wrapped around the sword grip".
+    image: the marked image (path, or 'latest' = the newest image attached in a Claude chat). The marks are
+           mapped onto the original image they were drawn on (found like find_marks: this session's picks, the
+           project's outputs, docs and guide references, also inside a page screenshot) and the edit is made
+           on that original at full resolution. If no original is found, the attached image itself is edited.
+    marks: which mark numbers to edit (from find_marks). Default: all; they must then be on one original.
+    source: force the original to edit (a path or request id), e.g. when find_marks matched the wrong one.
+    entries: guide entries in the marked area (e.g. ["Aldric"]): their descriptions and references keep details
+             right. project: as in generate_image.
+    strength: 1.0 = repaint the marked areas fully (fix wrong anatomy, remove or replace things); 0.4-0.7 =
+              keep their shapes and change details or colour.
+    GREEN MARKS: a green line next to a red mark = "put the red-marked thing here, pointing this way" (a green
+    loop = move it there without turning). This is a real redraw in two model steps, not a patch: 1) the model
+    removes the thing and draws what was behind it (belt, sash, clothing...); 2) the thing, turned and moved
+    onto the green mark (its end nearer to one end of the line stays at that end, e.g. a hilt at the belt), is
+    added back and the whole connected region (the new place and everything around where it attaches, e.g.
+    the hips and belt for a sword) is redrawn so it is attached and the picture makes sense. Outside those
+    areas nothing changes. Name the thing in the instruction ("his sword, hanging from the belt") and add
+    how it should attach. redraw_strength: how freely the region is redrawn (0.9; lower keeps the rough
+    placement more literally). reach: how far around the attachment the redraw extends, as a share of the
+    thing's length (0.3; larger redraws more of the body around it).
+    Each mark is repainted in a crop around it at ~1 MP (so small things like hands get detail) and pasted
+    back with a soft edge. ~10-15 s per mark per candidate.
+    """
+    global BUSY
+    _open_for_request(project)
+    if not 0.05 <= strength <= 1.0:
+        raise ValueError("strength must be between 0.05 and 1.0")
+    an = await asyncio.to_thread(_analyze_marks, image)
+    regs = an["regions"]
+    if marks:
+        bad = [m for m in marks if m not in [rg["number"] for rg in regs]]
+        if bad:
+            raise ValueError(f"no mark(s) {bad}; this image has marks 1-{len(regs)} (see find_marks)")
+        regs = [rg for rg in regs if rg["number"] in marks]
+    if source.strip():
+        sp = _image_path(source)
+        src_img = PILImage.open(sp).convert("RGB")
+        # map the marks with this original's own match, if it appears in the marked image
+        loc = await asyncio.to_thread(_locate_sources, an["marked"], _red_regions(an["marked"])[1], [sp])
+        for rg in regs:
+            rg["source"] = loc[0] if loc else None
+        if not loc and an["marked"].size != src_img.size:
+            raise ValueError("the forced source doesn't appear in the marked image and has a different size, so "
+                             "the marks can't be placed on it")
+    else:
+        srcs = {_norm(rg["source"]["path"]) if rg["source"] else "attached" for rg in regs}
+        if len(srcs) > 1:
+            listing = "; ".join(f"mark {rg['number']} on {rg['source']['path'].name if rg['source'] else 'the attached image'}"
+                                for rg in regs)
+            raise ValueError(f"the marks are on different originals ({listing}). Edit one original per call with "
+                             "marks=[...]")
+        sp = regs[0]["source"]["path"] if regs[0]["source"] else an["marked_path"]
+        src_img = PILImage.open(sp).convert("RGB")
+    W, H = src_img.size
+    masks = [await asyncio.to_thread(_source_mask, rg, rg["source"], W, H) for rg in regs]
+    greens = [_green_to_source(rg["green"], rg["source"]) if rg.get("green") else None for rg in regs]
+    if not instruction.strip() and not all(greens):
+        raise ValueError("say what to change in the red marks (instruction), or add a green mark showing where "
+                         "and which way the marked thing should go")
+    if _same_path(sp, an["marked_path"]):  # editing the attached picture itself: paint the pen strokes out first
+        src_img = await asyncio.to_thread(_clean_red, src_img)
+    plan = _plan("", entries or [], False, "style", True)   # only the entries' descriptions + checklist
+    char_refs = []
+    if S.get("project") and entries:
+        proj, _ = current()
+        for nm in entries:
+            e = _find_entry(proj, nm)
+            pr = _primary_ref(e)
+            if pr and e["kind"] in ("character", "creature", "prop") and len(char_refs) < 2:
+                char_refs.append({"path": e["_dir"] / pr["file"], "source": _eid(e),
+                                  "legend": ROLE_TEXT.get(e["kind"], "{name}").format(name=e["name"])})
+    def mark_text() -> str:
+        legend = " ".join([f"Image 1 shows {EDIT_LEGEND}."] +
+                          [f"Image {i} shows {r['legend']}." for i, r in enumerate(char_refs, 2)])
+        return "\n\n".join(x for x in [
+            f"Edit image 1: {instruction.strip().rstrip('.')}. Change only that; keep the rest of image 1 exactly "
+            "as it is, in the same art style, linework and colours.", plan["text"], f"Reference images: {legend}"]
+            if x)
+
+    thing = instruction.strip().rstrip(".") or "the object in the edited area"
+
+    def remove_text() -> str:
+        return "\n\n".join(x for x in [
+            "Edit image 1: remove the object in the edited area completely, together with any strap or holder that "
+            f"only holds it (the object: {thing}). Where it was, draw what is behind it so the picture is complete "
+            "and clean: continue the clothing, belt, sash, body, outlines and background naturally. Keep everything "
+            "else exactly as it is, in the same art style, linework and colours.", plan["text"],
+            "Reference images: Image 1 shows the picture (a crop around the edited area)."] if x)
+
+    def move_text(words: str) -> str:
+        return "\n\n".join(x for x in [
+            f"Edit image 1: add this object to it: {thing}. Image 2 shows the object alone at the exact position, "
+            f"angle and size it must have in image 1: put it exactly there, {words}, with the same design. Redraw "
+            "what it connects to (for example the belt, straps, hands or clothing around it) so it is held or "
+            "attached naturally and the whole picture makes sense. Keep everything else exactly as in image 1: "
+            "the same character, face, outfit details, colours, art style, linework and shading. The object "
+            "appears only once.",
+            plan["text"], "Reference images: Image 1 shows the picture (a crop). Image 2 shows the object alone, "
+            "in place."] if x)
+    text = move_text("in its new place") if any(greens) else mark_text()
+    n = max(1, min(MAX_CANDIDATES, candidates or _candidate_count()))
+    BUSY += 1
+    try:
+        startup = await _backend_ready()
+        seed = random.randrange(2**31) if seed < 0 else seed
+        rid = f"{dt.datetime.now():%m%d-%H%M%S}"
+        while rid in S["requests"] or (CAND / rid).exists():
+            rid += "x"
+        rdir = CAND / rid
+        rdir.mkdir(parents=True)
+        cands, out, moves = [], [], []
+        t_all = time.monotonic()
+        async with httpx.AsyncClient(timeout=120) as c:
+            ref_names = [await upload_ref(c, r["path"]) for r in char_refs]
+            for i in range(1, n + 1):
+                s = seed + i - 1
+                t0 = time.monotonic()
+                img, boxes = src_img, []
+                for m, g in zip(masks, greens):
+                    if g:  # 1) the model removes it (drawing what was behind), 2) adds it back in its new place
+                        mv = await asyncio.to_thread(_move_layers, img, m, g, reach)
+                        moves.append(mv["info"])
+                        clean, box1 = await _edit_once(c, mv["start"], mv["remove"], remove_text(), [], s, steps,
+                                                       1.0)
+                        img, box = await _redraw_once(c, clean, mv, move_text(mv["words"]), s + 7919, steps,
+                                                      redraw_strength)
+                        box = (min(box[0], box1[0]), min(box[1], box1[1]), max(box[2], box1[2]), max(box[3], box1[3]))
+                    else:
+                        img, box = await _edit_once(c, img, m, mark_text(), ref_names, s, steps, strength)
+                    boxes.append(box)
+                buf = io.BytesIO()
+                img.save(buf, "PNG")
+                png = buf.getvalue()
+                _write_bytes(rdir / f"cand_{i}.png", png)
+                cands.append({"number": i, "file": f"cand_{i}.png", "seed": s,
+                              "seconds": round(time.monotonic() - t0, 1)})
+                out += [f"Candidate {i} (seed {s})", _preview(png, preview_size)]
+                for bx in boxes:  # before | after of each edited area, to judge small fixes
+                    pair = PILImage.new("RGB", ((bx[2] - bx[0]) * 2 + 8, bx[3] - bx[1]), "white")
+                    pair.paste(src_img.crop(bx), (0, 0))
+                    pair.paste(img.crop(bx), (bx[2] - bx[0] + 8, 0))
+                    zb = io.BytesIO()
+                    pair.save(zb, "PNG")
+                    out += [f"Candidate {i}: marked area before | after", _preview(zb.getvalue(), preview_size)]
+    finally:
+        BUSY -= 1
+    meta = {"request_id": rid, "created": now_iso(), "project": plan["project"], "prompt": instruction,
+            "full_prompt": text, "entries": plan["entries"], "checklist": plan["checklist"],
+            "width": W, "height": H, "steps": steps, "model": MODEL,
+            "edit": {"source": str(sp), "marked": str(an["marked_path"]), "marks": [rg["number"] for rg in regs],
+                     "strength": strength, "moves": sorted(set(moves)) or None,
+                     "redraw_strength": redraw_strength if any(greens) else None,
+                     "reach": reach if any(greens) else None},
+            "references": [{"source": "edited image"}, *({"source": r["source"]} for r in char_refs)],
+            "candidates": cands, "picked": None}
+    _save(rdir / "request.json", meta)
+    S["requests"][rid] = meta
+    S["last_request"] = rid
+    _save_session()
+    checklist = ("\nChecklist (judge the candidates against it):\n" + "\n".join(f"- {x}" for x in plan["checklist"])
+                 if plan["checklist"] else "")
+    head = (f"{'[' + startup + '] ' if startup else ''}Edit request {rid} ({_mode_text()}): {n} candidates of "
+            f"{Path(sp).name} ({W}x{H}), marks {[rg['number'] for rg in regs]}"
+            f"{' (moved onto green marks: ' + '; '.join(sorted(set(moves))) + ')' if moves else ''}, "
+            f"{time.monotonic() - t_all:.0f} s."
+            f"{checklist}\nOnly the marked areas changed; judge them (the before | after crops) for the "
+            f"instruction, anatomy and seams. Then pick_candidate(request_id='{rid}', number=<best>).")
+    return [head, *out]
 
 
 # ---------------------------------------------------------------- startup

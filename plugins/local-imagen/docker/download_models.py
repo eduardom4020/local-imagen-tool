@@ -3,6 +3,7 @@
 Usage: python download_models.py [core] [extras]      (default: core)
   core   = FLUX.2 klein 4B (used by the MCP server), about 12 GB, Apache 2.0
   extras = Z-Image-Turbo int8, Illustrious XL 2.0, Animagine XL 4.0 (comparison models), about 26 GB
+  control = RefControl depth LoRA for FLUX.2 klein 4B (generate_image pose_mode='depth'), 92 MB, Apache 2.0
 """
 import os
 import shutil
@@ -17,6 +18,10 @@ SETS = {
         ("Comfy-Org/Flux-2-Klein-4B", "split_files/diffusion_models/flux-2-klein-4b.safetensors", "diffusion_models"),
         ("Comfy-Org/Flux-2-Klein-4B", "split_files/text_encoders/qwen_3_4b_fp4_flux2.safetensors", "text_encoders"),
         ("Comfy-Org/Flux-2-Klein-4B", "split_files/vae/flux2-vae.safetensors", "vae"),
+    ],
+    "control": [
+        ("thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora", "flux2_klein_4b_refcontrol_depth.safetensors",
+         "loras"),
     ],
     "extras": [
         ("Comfy-Org/Z-Image-Turbo", "split_files/diffusion_models/z_image_turbo_int8_convrot.safetensors", "diffusion_models"),

@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=2.3,<3", "httpx>=0.27", "pillow>=10", "filelock>=3.13", "psutil>=5.9", "send2trash>=1.8"]
+# dependencies = ["mcp>=2.3,<3", "httpx>=0.27", "pillow>=10.1", "filelock>=3.13", "psutil>=5.9", "send2trash>=1.8",
+#                 "numpy>=1.26", "opencv-python-headless>=4.9"]
 # ///
 """Call one tool of the local-imagen MCP server over stdio, for sessions where its tools aren't loaded.
 

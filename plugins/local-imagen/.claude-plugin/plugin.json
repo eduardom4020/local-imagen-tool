@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "local-imagen",
-  "version": "1.3.0",
-  "description": "Local AI image generation for Claude: ComfyUI in Docker + FLUX.2 klein 4B. Game projects carry a style guide managed by chat (styles, characters, creatures, locations, props, poses, cameras) so images stay consistent; every Claude session is isolated; a private candidate picker (image-picker agent) shows you only the best image; a Blender pose renderer draws mannequin pose guides for action shots.",
+  "version": "1.4.0",
+  "description": "Local AI image generation for Claude: ComfyUI in Docker + FLUX.2 klein 4B. Game projects carry a style guide managed by chat (styles, characters, creatures, locations, props, poses, cameras) so images stay consistent; every Claude session is isolated; a private candidate picker (image-picker agent) shows you only the best image; a Blender pose renderer draws mannequin pose guides for action shots; mark an image in red (and green for where things should go) and only that part is redrawn.",
   "author": {
     "name": "Eduardo Braga"
   },
@@ -13,7 +13,9 @@
     "concept-art",
     "flux",
     "game-dev",
+    "image-editing",
     "image-generation",
+    "inpainting",
     "mcp",
     "pose",
     "style-guide"
