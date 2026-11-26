@@ -30,7 +30,19 @@ POSE KEYS
              aim (thigh direction relative to the hips, same form), twist (+ = knee and toes turn outward),
              knee (bend, 0 = straight), ankle (+ = toes point down)
   props:     [{"type": "sword", "hand": "right", "grip": "normal" | "reverse", "length": 3.2 (blade, in heads),
-              "two_handed": false (true = the other hand also holds the grip; its arm is placed automatically)}]
+              "two_handed": false (true = the other hand also holds the grip; its arm is placed automatically)},
+             {"type": "scabbard", "side": "left", "angle": 35 (tilt back from vertical), "length": 3.4 (heads),
+              "sheathed": true (a sword's hilt sticks out of it)}]
+  DETAIL (job "detail": ["hands", "feet", "pelvis"]): finer parts for precision work.
+    hands: jointed fingers (3 segments each) and thumb. Per arm: "hand" = "fist" | "grip" | "relaxed" | "open" |
+           "point", or "fingers": {"index": [mcp, pip, dip], "middle": [...], "ring": [...], "pinky": [...],
+           "thumb": "wrap" | "open" | "relaxed"} (flexion angles in degrees). A hand holding a sword grips it.
+    feet:  a hinged foot (heel, arch, toe box on the ball of the foot, ankle bones); leg key "toes" (+ = bent up).
+    pelvis: a belt line, a front marker and hip bones, so the pelvis rotation reads clearly.
+    eyes:  eyeballs with pupils; head key "gaze": {"up": deg, "left": deg} aims them on their own (e.g. the head
+           nods down while the eyes look up).
+  Extra outputs: "parts" = <name>-parts.png, every body part in its own flat colour (the JSON lists them), for
+  attention masks.
 """
 import json
 import math
@@ -125,7 +137,9 @@ def build_figure(fig, pose, color_sides):
     u = B / 6.0                 # body unit (= one head on a 7-head figure)
 
     grey = (0.52, 0.52, 0.53)
-    mats = {"body": material("body", grey), "sword": material("sword", (0.28, 0.29, 0.31), 0.35, 0.6)}
+    mats = {"body": material("body", grey), "sword": material("sword", (0.28, 0.29, 0.31), 0.35, 0.6),
+            "detail": material("detail", (0.40, 0.40, 0.43)), "eye": material("eye", (0.88, 0.88, 0.90)),
+            "pupil": material("pupil", (0.04, 0.04, 0.05))}
     if color_sides:  # optional: tell left from right at a glance (left = cool, right = warm)
         mats["left"], mats["right"] = material("left", (0.50, 0.58, 0.70)), material("right", (0.72, 0.58, 0.50))
     else:
@@ -143,6 +157,14 @@ def build_figure(fig, pose, color_sides):
         add_ellipsoid(bm, (0, 0.02 * u, -0.12 * u), (0.58 * u * hw, 0.40 * u * bw, 0.40 * u))
         add_ellipsoid(bm, (0, 0.04 * u, -0.36 * u), (0.42 * u * hw, 0.34 * u * bw, 0.22 * u))   # crotch
     make_obj("pelvis", pelvis, J["root"], body)
+    if "pelvis" in DETAIL:   # belt line, front marker, hip bones: the pelvis rotation reads at a glance
+        def pelvis_marks(bm):
+            add_ellipsoid(bm, (0, 0.02 * u, 0.08 * u), (0.62 * u * hw, 0.43 * u * bw, 0.055 * u))      # belt line
+            add_ellipsoid(bm, (0, -0.44 * u * bw, 0.06 * u), (0.09 * u, 0.05 * u, 0.08 * u), segs=(16, 8))
+            for sx in (1, -1):
+                add_ellipsoid(bm, (sx * 0.50 * u * hw, -0.16 * u * bw, 0.0), (0.09 * u, 0.09 * u, 0.09 * u),
+                              segs=(16, 8))                                                            # hip bones
+        make_obj("pelvis_marks", pelvis_marks, J["root"], mats.get("detail", body))
     make_obj("abdomen", lambda bm: add_ellipsoid(bm, (0, 0.01 * u, 0.14 * u),
                                                  (0.44 * u * (sw + hw) / 2, 0.32 * u * bw, 0.42 * u)),
              J["spine"], body)
@@ -167,6 +189,18 @@ def build_figure(fig, pose, color_sides):
         for s in (1, -1):
             add_ellipsoid(bm, (s * 0.35 * H, 0.04 * H, 0.52 * H), (0.04 * H, 0.09 * H, 0.13 * H), segs=(16, 8))
     make_obj("head", head, J["head"], body)
+    if "eyes" in DETAIL:   # eyeballs + pupils that aim on their own: e.g. head down, eyes looking up
+        gaze = (pose.get("head") or {}).get("gaze") or {}
+        look = q(Z, num(gaze, "left")) @ q(X, -num(gaze, "up"))
+        d = look @ Vector((0, -1, 0))
+        re_ = 0.068 * H
+        for side_, sx in (("left", 1), ("right", -1)):
+            c = Vector((sx * 0.13 * H, -0.355 * H, 0.64 * H))
+            make_obj(f"{side_}_eye", lambda bm, c_=c: add_ellipsoid(bm, c_, (re_, re_, re_), segs=(20, 10)),
+                     J["head"], mats["eye"])
+            make_obj(f"{side_}_pupil", lambda bm, c_=c: add_ellipsoid(bm, c_ + d * re_, (0.032 * H, 0.014 * H, 0.032 * H),
+                                                                     rot=Vector((0, -1, 0)).rotation_difference(d),
+                                                                     segs=(16, 8)), J["head"], mats["pupil"])
 
     L_up, L_fore = 1.35 * u, 1.08 * u
     L_thigh, L_shin = 1.62 * u, 1.56 * u
@@ -187,8 +221,14 @@ def build_figure(fig, pose, color_sides):
         for p in pose.get("props", []):
             main = str(p.get("hand", "right")).lower()
             if p.get("type") == "sword" and (main == side or p.get("two_handed")):
-                shape = "fist"
-        hands[side] = make_obj(f"{side}_hand", lambda bm, sh_=shape, s_=s: build_hand(bm, sh_, s_, u), wr, m)
+                shape = "grip"
+        if "hands" in DETAIL:
+            flex, thumb = _hand_flex(arm, shape)
+            hands[side] = make_obj(f"{side}_hand", lambda bm, s_=s, f_=flex, t_=thumb:
+                                   build_hand_detailed(bm, s_, u, f_, t_), wr, m)
+        else:
+            hands[side] = make_obj(f"{side}_hand", lambda bm, sh_=("fist" if shape == "grip" else shape), s_=s:
+                                   build_hand(bm, sh_, s_, u), wr, m)
 
         hp = make_joint(f"{side}_hip", J["root"], (s * 0.44 * u * hw, 0, -0.25 * u))
         kn = make_joint(f"{side}_knee", hp, (0, 0, -L_thigh))
@@ -204,16 +244,148 @@ def build_figure(fig, pose, color_sides):
 
         def foot(bm):
             add_ellipsoid(bm, (0, 0, 0), (0.10 * u, 0.10 * u, 0.10 * u), segs=(16, 8))
-            add_ellipsoid(bm, (0, -0.30 * u, -0.20 * u), (0.17 * u, 0.56 * u, 0.12 * u))   # sole
-            add_ellipsoid(bm, (0, -0.10 * u, -0.10 * u), (0.15 * u, 0.32 * u, 0.17 * u))   # heel + instep
-        make_obj(f"{side}_foot", foot, an, m)
+            if "feet" not in DETAIL:
+                add_ellipsoid(bm, (0, -0.30 * u, -0.20 * u), (0.17 * u, 0.56 * u, 0.12 * u))   # sole
+                add_ellipsoid(bm, (0, -0.10 * u, -0.10 * u), (0.15 * u, 0.32 * u, 0.17 * u))   # heel + instep
+                return
+            add_ellipsoid(bm, (0, 0.06 * u, -0.19 * u), (0.13 * u, 0.17 * u, 0.12 * u))      # heel
+            add_ellipsoid(bm, (0, -0.28 * u, -0.20 * u), (0.15 * u, 0.32 * u, 0.11 * u))     # arch / sole
+            add_ellipsoid(bm, (0, -0.16 * u, -0.08 * u), (0.13 * u, 0.26 * u, 0.13 * u))     # instep
+            for sx in (1, -1):
+                add_ellipsoid(bm, (sx * 0.10 * u, 0.0, -0.02 * u), (0.04 * u, 0.04 * u, 0.04 * u), segs=(12, 6))
+        fo = make_obj(f"{side}_foot", foot, an, m)
+        if "feet" in DETAIL:   # toe box hinged on the ball of the foot
+            ball = make_joint(f"{side}_ball", fo, (0, -0.56 * u, -0.21 * u))
+            J[ball.name] = ball
+            make_obj(f"{side}_toes", lambda bm: add_capsule(bm, (0, 0, 0), (0, -0.28 * u, -0.01 * u), 0.115 * u,
+                                                            0.085 * u), ball, m)
 
     props = []
     for p in pose.get("props", []):
         if p.get("type") == "sword":
             side = str(p.get("hand", "right")).lower()
-            props.append(build_sword(p, hands[side], mats["sword"], u, H))
+            props.append(build_sword(p, hands[side], mats["sword"], u, H, 1 if side == "left" else -1))
+        elif p.get("type") == "scabbard":
+            props.append(build_scabbard(p, J["root"], mats["sword"], u, H, hw))
     return J, hands, props, {"H": H, "u": u, "B": B}
+
+
+def build_scabbard(p, root, mat, u, H, hw):
+    """A scabbard hanging from the belt at one hip, tilted back; optionally with a sheathed sword's hilt."""
+    side = str(p.get("side", "left")).lower()
+    s = 1 if side == "left" else -1
+    L = max(1.0, num(p, "length", 3.4)) * H
+
+    def build(bm):
+        add_cone(bm, (0, 0, 0), (0, 0, -L), 0.075 * u, 0.055 * u, 16)
+        add_ellipsoid(bm, (0, 0, -L), (0.06 * u, 0.06 * u, 0.08 * u), segs=(12, 6))                # chape
+        add_ellipsoid(bm, (0, 0, -0.10 * u), (0.11 * u, 0.09 * u, 0.06 * u), segs=(12, 6))          # throat ring
+        if p.get("sheathed", True):
+            add_ellipsoid(bm, (0, 0, 0.06 * u), (0.30 * u, 0.06 * u, 0.04 * u), segs=(16, 8))      # guard
+            add_cone(bm, (0, 0, 0.08 * u), (0, 0, 0.75 * u), 0.045 * u, 0.045 * u, 12)            # grip
+            add_ellipsoid(bm, (0, 0, 0.80 * u), (0.065 * u,) * 3, segs=(12, 6))                    # pommel
+    ob = make_obj("scabbard", build, root, mat)
+    ob.location = Vector((s * 0.66 * u * hw, 0.10 * u, -0.05 * u))
+    ob.rotation_mode = "QUATERNION"
+    ob.rotation_quaternion = q(X, -num(p, "angle", 35)) @ q(Y, s * num(p, "spread", 12))
+    return ob
+
+
+DETAIL = set()
+# jointed hand, in metres for a hand on a 7-head, 1.7 m figure (scaled by u). Frame: x = index side, w = wrist ->
+# knuckles, v = palm normal; mapped onto the hand object: x -> -Y (thumb forward), w -> -Z (down), v -> -s*X.
+FINGERS = {"index": (0.029, 0.000, (0.041, 0.024, 0.019), 0.0086),
+           "middle": (0.010, 0.004, (0.045, 0.027, 0.020), 0.0090),
+           "ring": (-0.009, 0.000, (0.042, 0.026, 0.020), 0.0084),
+           "pinky": (-0.026, -0.009, (0.033, 0.019, 0.017), 0.0074)}
+HAND_PRESETS = {"fist": [68, 98, 48], "grip": [68, 98, 48], "relaxed": [22, 32, 16], "open": [2, 4, 2],
+                "point": None}
+PALM_HALF, WRIST_W = 0.0115, -0.088
+GRIP_C = (-0.0085, 0.0230)                  # (w, v) of the hole of a fist: where a grip passes
+U_REF = 1.457 / 6.0                         # body unit of the reference figure
+
+
+def _finger_pts(name, flex):
+    x, dw, lens, r = FINGERS[name]
+    pts, th = [Vector((x, dw, 0.0))], 0.0
+    for L, f in zip(lens, flex):
+        th += math.radians(f)
+        pts.append(pts[-1] + Vector((0, L * math.cos(th), L * math.sin(th))))
+    return pts, [r * 1.08, r, r * 0.93, r * 0.86]
+
+
+def _hand_flex(arm, shape):
+    fing = arm.get("fingers") if isinstance(arm.get("fingers"), dict) else {}
+    out = {}
+    for f in FINGERS:
+        if f in fing:
+            out[f] = [float(a) for a in fing[f]][:3]
+        elif shape == "point":
+            out[f] = [0, 0, 0] if f == "index" else HAND_PRESETS["fist"]
+        else:
+            base = HAND_PRESETS.get(shape) or HAND_PRESETS["relaxed"]
+            k = 1.0 + (0.15 * list(FINGERS).index(f) if shape == "relaxed" else 0.0)   # little finger curls more
+            out[f] = [a * k for a in base]
+    thumb = fing.get("thumb") or ("wrap" if shape in ("fist", "grip", "point") else
+                                  "open" if shape == "open" else "relaxed")
+    return out, thumb
+
+
+def fist_center(s, u):
+    """Where a held grip passes, in the hand object's frame (detailed hands)."""
+    k = u / U_REF
+    return Vector((-s * GRIP_C[1] * k, 0.0, -(GRIP_C[0] - WRIST_W) * k))
+
+
+def build_hand_detailed(bm, s, u, flex, thumb):
+    k = u / U_REF
+
+    def T(p):   # hand-model (x, w, v) in metres -> the hand object's frame
+        return Vector((-s * p.z * k, -p.x * k, -(p.y - WRIST_W) * k))
+    xs = [FINGERS[f][0] for f in FINGERS]
+    x0, x1 = min(xs) - 0.008, max(xs) + 0.008
+    add_ellipsoid(bm, T(Vector(((x0 + x1) / 2, -0.042, 0))),
+                  (PALM_HALF * 1.15 * k, ((x1 - x0) / 2 + 0.004) * k, 0.047 * k), rot=_hand_rot(s))
+    for f in FINGERS:
+        x, dw, _, r = FINGERS[f]
+        add_ellipsoid(bm, T(Vector((x, dw - 0.002, 0.001))), (r * 1.18 * k,) * 3, segs=(16, 8))   # knuckle
+        pts, radii = _finger_pts(f, flex[f])
+        for i in range(3):
+            add_capsule(bm, T(pts[i]), T(pts[i + 1]), radii[i] * k * (1.0 if i else 0.98), radii[i + 1] * k)
+    add_ellipsoid(bm, T(Vector((x1 - 0.004, -0.056, PALM_HALF * 0.9))), (0.010 * k, 0.013 * k, 0.022 * k),
+                  rot=_hand_rot(s))                                                                    # thenar
+    ix = FINGERS["index"][0]
+    if thumb == "wrap":   # around the grip, its tip on the index finger's middle phalanx
+        pts, _ = _finger_pts("index", flex["index"])
+        mid = (pts[1] + pts[2]) / 2
+        out = Vector((0, mid.y - GRIP_C[0], mid.z - GRIP_C[1]))
+        out = out.normalized() if out.length > 1e-6 else Vector((0, 0, 1))
+        gr = 0.0104
+        tip = Vector((ix - 0.010, GRIP_C[0], GRIP_C[1])) + out * (gr + 2 * 0.0088 + 0.0085)
+        mcp = Vector((ix + 0.020, GRIP_C[0] - 0.032, GRIP_C[1] - 0.006))
+        a0 = math.atan2(mcp.z - GRIP_C[1], mcp.y - GRIP_C[0])
+        a1 = math.atan2(tip.z - GRIP_C[1], tip.y - GRIP_C[0])
+        am = a0 + (((a1 - a0 + math.pi) % (2 * math.pi)) - math.pi) * 0.55
+        rr = gr + 0.0135
+        ip = Vector((ix + 0.010, GRIP_C[0] + rr * math.cos(am), GRIP_C[1] + rr * math.sin(am)))
+    elif thumb == "open":
+        mcp, ip, tip = (Vector((ix + 0.034, -0.040, 0.010)), Vector((ix + 0.050, -0.016, 0.012)),
+                        Vector((ix + 0.060, 0.008, 0.012)))
+    else:                 # relaxed: along the index finger's side
+        mcp, ip, tip = (Vector((ix + 0.026, -0.040, 0.014)), Vector((ix + 0.030, -0.014, 0.024)),
+                        Vector((ix + 0.024, 0.008, 0.032)))
+    cmc = Vector((ix + 0.006, -0.068, PALM_HALF * 0.6))
+    for a, b, ra, rb in ((cmc, mcp, 0.0125, 0.0105), (mcp, ip, 0.0105, 0.0098), (ip, tip, 0.0098, 0.0090)):
+        add_capsule(bm, T(a), T(b), ra * k, rb * k)
+    add_capsule(bm, T(Vector(((x0 + x1) / 2, WRIST_W, 0))), T(Vector(((x0 + x1) / 2, -0.070, 0))),
+                0.024 * k, 0.026 * k)                                                                 # wrist
+    if s > 0:   # the left hand is the mirror image: turn its faces the right way out
+        bmesh.ops.reverse_faces(bm, faces=list(bm.faces))
+
+
+def _hand_rot(s):
+    """Ellipsoid radii are already given as (thickness, width, length) = the hand object's (X, Y, Z)."""
+    return None
 
 
 def build_hand(bm, shape, s, u):
@@ -229,11 +401,11 @@ def build_hand(bm, shape, s, u):
                 0.045 * u, 0.035 * u)                                                               # thumb
 
 
-def build_sword(p, hand_obj, mat, u, H):
+def build_sword(p, hand_obj, mat, u, H, s=-1):
     """Sword through the fist: the grip runs front-back through the hand; the blade leaves the thumb side
     (normal grip) or the little-finger side (reverse grip). Edges face up/down when the arm hangs."""
     blade = max(0.5, num(p, "length", 3.2)) * H
-    c = Vector((0, -0.01 * u, -0.23 * u))  # fist centre
+    c = fist_center(s, u) if "hands" in DETAIL else Vector((0, -0.01 * u, -0.23 * u))  # fist centre
 
     back = 0.62 * u if p.get("two_handed") else 0.30 * u  # a two-handed grip has room for the second fist
 
@@ -259,7 +431,9 @@ def build_sword(p, hand_obj, mat, u, H):
     ob.location = c
     ob.rotation_mode = "QUATERNION"
     # a fist holds the grip about 20 degrees past square: the blade leans toward the little finger's side
-    ob.rotation_quaternion = q(X, 20) if sign == 1 else q(Z, 180) @ q(X, -20)
+    # (jointed fingers wrap a square grip, so no extra tilt there)
+    tilt = 0 if "hands" in DETAIL else 20
+    ob.rotation_quaternion = q(X, tilt) if sign == 1 else q(Z, 180) @ q(X, -tilt)
     return ob
 
 
@@ -319,6 +493,8 @@ def apply_pose(J, pose):
         J[f"{side}_hip"].rotation_quaternion = swing(aim_vector(aim, s)) @ q(Z, s * num(lg, "twist"))
         J[f"{side}_knee"].rotation_quaternion = q(X, max(0.0, min(165.0, num(lg, "knee"))))
         J[f"{side}_ankle"].rotation_quaternion = q(X, num(lg, "ankle"))
+        if f"{side}_ball" in J:
+            J[f"{side}_ball"].rotation_quaternion = q(X, -num(lg, "toes"))
 
 
 def two_hand_ik(J, hands, sword, p, dims, warnings):
@@ -330,8 +506,9 @@ def two_hand_ik(J, hands, sword, p, dims, warnings):
     u = dims["u"]
     bpy.context.view_layer.update()
     r_hand = hands[main].matrix_world.to_quaternion()
-    grip = sword.matrix_world @ Vector((0, 0.40 * u, 0))
-    target = grip - r_hand @ Vector((0, -0.01 * u, -0.23 * u))      # where the off wrist must be
+    grip = sword.matrix_world @ Vector((0, (0.36 if "hands" in DETAIL else 0.40) * u, 0))
+    fc = fist_center(s, u) if "hands" in DETAIL else Vector((0, -0.01 * u, -0.23 * u))
+    target = grip - r_hand @ fc                                       # where the off wrist must be
     sh, el, wr = J[f"{off}_shoulder"], J[f"{off}_elbow"], J[f"{off}_wrist"]
     S = sh.matrix_world.translation.copy()
     L1, L2 = el.location.length, wr.location.length
@@ -523,6 +700,22 @@ def depth_material(near, far):
     return m
 
 
+PART_GROUPS = ("left_hand", "right_hand", "left_forearm", "right_forearm", "left_upper_arm", "right_upper_arm",
+               "left_thigh", "right_thigh", "left_shin", "right_shin", "left_foot", "right_foot", "left_toes",
+               "right_toes", "head", "neck", "chest", "abdomen", "pelvis", "sword", "scabbard")
+
+
+def part_group(obj_name):
+    n = obj_name.split(".")[0]
+    if n == "pelvis_marks":
+        return "pelvis"
+    if n.endswith("_eye") or n.endswith("_pupil"):
+        return "head"
+    if n.endswith("_toes"):
+        return n.replace("_toes", "_foot")
+    return n if n in PART_GROUPS else n
+
+
 def render_to(sc, path):
     sc.render.filepath = path
     bpy.ops.render.render(write_still=True)
@@ -533,6 +726,8 @@ def run_job(job):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     sc = setup_scene(job)
     pose = job.get("pose") or {}
+    DETAIL.clear()
+    DETAIL.update(str(d).lower() for d in job.get("detail") or [])
     J, hands, props, dims = build_figure(job.get("figure") or {}, pose, bool(job.get("color_sides")))
     body_objs = [o for o in sc.objects if o.type == "MESH" and o.name not in [p.name for p in props]]
     apply_pose(J, pose)
@@ -542,6 +737,12 @@ def run_job(job):
             two_hand_ik(J, hands, ob, p, dims, warnings)
     ground(J, body_objs, pose, dims)
     all_objs = body_objs + props
+    show = set(job.get("show") or [])
+    if show:   # a partial mannequin (e.g. only the hands and the sword), framed on those parts
+        for o in all_objs:
+            if part_group(o.name) not in show:
+                o.hide_render = True
+        all_objs = [o for o in all_objs if not o.hide_render] or all_objs
     pts = world_verts(all_objs)
 
     cam = bpy.data.objects.new("camera", bpy.data.cameras.new("camera"))
@@ -551,6 +752,8 @@ def run_job(job):
     target, direction, dist = frame_camera(sc, cam, pts, cam_cfg)
     add_lights(target, direction, dims)
     floor = add_floor(dims["u"])
+    if show:
+        floor.hide_render = True
 
     out, name = job["out"].rstrip("/\\"), job["name"]
     outputs = job.get("outputs") or ["mannequin"]
@@ -558,6 +761,28 @@ def run_job(job):
     if "mannequin" in outputs:
         render_to(sc, f"{out}/{name}.png")
         files["mannequin"] = f"{name}.png"
+    parts_map = {}
+    if "parts" in outputs:   # every body part in one flat colour: the server builds attention masks from it
+        floor.hide_render = True
+        sc.render.engine = "BLENDER_WORKBENCH"
+        shd = sc.display.shading
+        shd.light, shd.color_type = "FLAT", "OBJECT"
+        shd.show_cavity = shd.show_object_outline = False
+        sc.display.render_aa = "OFF"
+        sc.render.dither_intensity = 0.0
+        sc.view_settings.view_transform = "Standard"
+        groups = sorted({part_group(o.name) for o in all_objs})
+        for i, g in enumerate(groups):
+            c = ((i * 53) % 200 + 40, (i * 97) % 200 + 40, (i * 151) % 200 + 40)
+            parts_map[g] = c
+        for o in all_objs:
+            c = parts_map[part_group(o.name)]
+            lin = [((v / 255) / 12.92) if v / 255 <= 0.04045 else (((v / 255) + 0.055) / 1.055) ** 2.4 for v in c]
+            o.color = (*lin, 1.0)
+        render_to(sc, f"{out}/{name}-parts.png")
+        files["parts"] = f"{name}-parts.png"
+        sc.render.engine = "CYCLES"
+        floor.hide_render = bool(show)
     inv = cam.matrix_world.inverted()
     depths = [-(inv @ p).z for p in pts]
     near, far = min(depths), max(depths)
@@ -593,11 +818,21 @@ def run_job(job):
         joints[f"{side}_hand_tip"] = px(hands[side].matrix_world @ Vector((0, 0, -0.62 * u)))
         joints[f"{side}_toe"] = px(sc.objects[f"{side}_foot"].matrix_world @ Vector((0, -0.84 * u, -0.19 * u)))
     for p in props:
-        lo = min(p.data.vertices, key=lambda v: v.co.y).co
-        joints["sword_tip"] = px(p.matrix_world @ lo)
+        if p.name.startswith("sword"):
+            lo = min(p.data.vertices, key=lambda v: v.co.y).co
+            joints["sword_tip"] = px(p.matrix_world @ lo)
+            joints["sword_guard"] = px(p.matrix_world @ Vector((0, -0.23 * u, 0)))
+            joints["sword_pommel"] = px(p.matrix_world @ Vector((0, max(v.co.y for v in p.data.vertices), 0)))
+        elif p.name.startswith("scabbard"):
+            joints["scabbard_top"] = px(p.matrix_world.translation)
+    if "hands" in DETAIL:
+        for side, s_ in (("left", 1), ("right", -1)):
+            joints[f"{side}_fist"] = px(hands[side].matrix_world @ fist_center(s_, u))
+    joints["pelvis_front"] = px(sc.objects["pelvis"].matrix_world @ Vector((0, -0.44 * u, 0.06 * u)))
     xs = [px(p) for p in pts[::7]]
     bbox = [min(a for a, _ in xs), min(b for _, b in xs), max(a for a, _ in xs), max(b for _, b in xs)]
-    info = {"name": name, "files": files, "warnings": warnings, "width": W, "height": Hh, "joints_px": joints, "figure_bbox_px": bbox,
+    info = {"name": name, "files": files, "warnings": warnings, "width": W, "height": Hh, "joints_px": joints,
+            "figure_bbox_px": bbox, "parts": parts_map, "detail": sorted(DETAIL),
             "camera": {"azimuth": num(cam_cfg, "azimuth", 0), "elevation": num(cam_cfg, "elevation", 5),
                        "elevation_used": cam_cfg.get("_elevation_used"),
                        "distance": num(cam_cfg, "distance", 4.0), "lens": round(cam.data.lens, 1),

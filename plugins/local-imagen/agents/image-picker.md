@@ -60,6 +60,20 @@ not draw a new image. Instead:
    - Without a guide, edit_image copies what is inside the mark very closely even at strength 1.0, so a plain
      edit can't reshape anatomy much. Say so in your note instead of retrying many times.
 
+## 1b. Draw an approved simulation (pose simulator)
+If the request names a simulation (from `simulate_pose`, approved by the user), don't compose your own image.
+Call `draw_simulation(simulation=<id>, instruction=..., entries=[...], project=...)`.
+- For a new image, it generates with the placed mannequin and the depth model.
+- For an existing scene, it redraws only the attention mask from scratch, following the mannequin.
+- The instruction describes what to draw at the affected parts (clothing, hands, the held object, the
+  background behind removed parts), not the mannequin.
+
+Judge as usual:
+- the pose and details match the simulation;
+- the drawing style matches the rest of the picture;
+- nothing is doubled;
+- there are no seams or blur.
+
 ## 1. Generate
 - **entries**: list every guide entry the request involves, by name (or kind/name). If you're unsure what exists,
   call `guide_list` once (read-only). The server adds each entry's fixed description, its reference image and the

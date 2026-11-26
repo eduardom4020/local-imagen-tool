@@ -120,6 +120,21 @@ not draw a new image.
     his belt on a buckled strap".
   - Two settings: `reach` (default 0.3) sets how much of the body around the attachment is redrawn, and
     `redraw_strength` (default 0.9) sets how freely it is redrawn.
+- **Pose simulator and attention mask.** Every request that creates or edits a character's position
+  (a pose, a grip, where someone stands, adding a character to a picture) goes through a 3D simulation first:
+  1. `simulate_pose` places the Blender mannequin in the scene. For an edit it goes over the character it
+     changes; for a new character, where it should stand. Placement uses anchor points in scene pixels, a
+     box, or scale and offset.
+  2. The preview (scene + blue mannequin, with a grid and the anchors) is shown to the user, who confirms the
+     placement and details or asks for refinements. Claude simulates again until the user approves.
+  3. On request, Claude adds 3D detail parts (`detail`): jointed hands and fingers (fist, grip, relaxed, open,
+     point, or per-finger angles), hinged feet, and a pelvis that shows its rotation. Accessories are props
+     (sword, scabbard). `show` renders a close-up of only some parts, which can then be anchored on the
+     picture, for example the hands on a drawn sword grip.
+  4. When the user says to draw it, `attention_mask` works out every region the change affects: the new
+     parts, the parts that connect to them, the old pose (`old=` another simulation) and extra areas.
+     `draw_simulation` then redraws only that mask, from scratch, following the mannequin's depth map. For a
+     new image it generates with the depth model. Nothing is blurred or pasted.
 - **Guided redraw (precision work with a mannequin):** `edit_image(guide=<depth map>, strength=1.0)`.
   - The guide is a depth map (near = bright), the same size as the picture, of a Blender mannequin placed
     exactly where something must go. For example, two hands in a correct two-handed grip, lined up with the

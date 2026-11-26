@@ -1209,7 +1209,17 @@ mcp = MCPServer(
         "mannequin exactly (render_pose, or a custom Blender render), make its depth map lined up with the picture, "
         "and edit with edit_image(guide=<depth map>, strength=1.0): the model redraws the marked area from "
         "scratch following the guide. Never paste, trace or blend mannequin pixels into the picture, and never "
-        "blur or smudge areas: without a guide, edit_image copies what is inside the mark very closely."
+        "blur or smudge areas: without a guide, edit_image copies what is inside the mark very closely.\n\n"
+        "POSE SIMULATOR + ATTENTION MASK (the user's workflow). For EVERY request that creates or edits a "
+        "character's position (a pose, a grip, where someone stands, adding a character to a picture), before any "
+        "image generation: 1) simulate_pose: the Blender mannequin placed in the scene (for an edit, over the "
+        "character it changes; for a new character, where it goes); 2) show its preview to the user and ask "
+        "whether the placement and every detail are right; 3) refine with them, adding 3D detail parts as they "
+        "ask (hands and fingers, pelvis rotation, feet, accessories: sword, scabbard) and simulate again; 4) only "
+        "when they say to draw it: attention_mask (the regions the change affects: new parts, connecting parts, "
+        "the old pose) and show it, then delegate to the image-picker with the simulation id, which calls "
+        "draw_simulation (a from-scratch redraw of the mask following the mannequin's depth). Never draw a "
+        "position change without an approved simulation."
     ),
 )
 
@@ -1933,8 +1943,10 @@ async def clear_session(stop: bool = True) -> str:
     for rid in list(S["requests"]):
         _close_request(rid, delete_selected=True)
     prev = _mode_text()
-    S.update(active=[], candidates=None, last_request=None, project=None, scratch=False, poses=[], speed=None)
+    S.update(active=[], candidates=None, last_request=None, project=None, scratch=False, poses=[], speed=None,
+             sims={}, last_sim=None)
     shutil.rmtree(POSES, ignore_errors=True)
+    shutil.rmtree(SIMS, ignore_errors=True)
     _save_session()
     msg = (f"Session cleared ({prev} closed): {n_open} unapproved image(s) discarded, references detached, "
            f"{DEFAULT_CANDIDATES} candidates per request, speed '{DEFAULT_SPEED}'. The next request will ask which "
@@ -2224,10 +2236,10 @@ def _pose_presets() -> dict:
 
 POSE_PARTS = {
     "root": {"turn", "pitch", "roll", "lift", "ground"}, "spine": {"bend", "side", "twist"},
-    "head": {"nod", "tilt", "turn"},
-    "left_arm": {"aim", "twist", "elbow", "wrist", "wrist_tilt", "hand"},
-    "right_arm": {"aim", "twist", "elbow", "wrist", "wrist_tilt", "hand"},
-    "left_leg": {"aim", "twist", "knee", "ankle"}, "right_leg": {"aim", "twist", "knee", "ankle"},
+    "head": {"nod", "tilt", "turn", "gaze"},
+    "left_arm": {"aim", "twist", "elbow", "wrist", "wrist_tilt", "hand", "fingers"},
+    "right_arm": {"aim", "twist", "elbow", "wrist", "wrist_tilt", "hand", "fingers"},
+    "left_leg": {"aim", "twist", "knee", "ankle", "toes"}, "right_leg": {"aim", "twist", "knee", "ankle", "toes"},
 }
 AIM_WORDS = {"forward", "front", "back", "backward", "up", "down", "out", "outward", "side", "in", "across", "inward"}
 AIM_KEYS = {"forward", "back", "up", "down", "out", "in", "across"}
@@ -2256,8 +2268,9 @@ def _mirror_pose(spec: dict) -> dict:
     out: dict = {}
     for k, v in spec.items():
         if k == "props":
-            out[k] = [{**p, "hand": "left" if str(p.get("hand", "right")).lower() == "right" else "right"}
-                      for p in v]
+            out[k] = [{**p, "side": "right" if str(p.get("side", "left")).lower() == "left" else "left"}
+                      if p.get("type") == "scabbard" else
+                      {**p, "hand": "left" if str(p.get("hand", "right")).lower() == "right" else "right"} for p in v]
             continue
         nk = ("right_" + k[5:]) if k.startswith("left_") else ("left_" + k[6:]) if k.startswith("right_") else k
         v = dict(v)
@@ -2265,6 +2278,8 @@ def _mirror_pose(spec: dict) -> dict:
             for key in ("turn", "roll", "twist", "side", "tilt"):
                 if key in v:
                     v[key] = -float(v[key])
+            if isinstance(v.get("gaze"), dict) and "left" in v["gaze"]:
+                v["gaze"] = {**v["gaze"], "left": -float(v["gaze"]["left"])}
         out[nk] = v  # limb values are side-relative already
     return out
 
@@ -2300,10 +2315,11 @@ def _resolve_pose(pose) -> tuple[dict, dict]:
             if not isinstance(v, list):
                 raise ValueError("props must be a list, e.g. [{'type': 'sword', 'hand': 'right'}]")
             for p in v:
-                if not isinstance(p, dict) or p.get("type") != "sword":
-                    raise ValueError("the only prop so far is {'type': 'sword', 'hand': 'right'|'left', "
-                                     "'grip': 'normal'|'reverse', 'length': <blade length in heads, default 3.2>, "
-                                     "'two_handed': true|false}")
+                if not isinstance(p, dict) or p.get("type") not in ("sword", "scabbard"):
+                    raise ValueError("props are {'type': 'sword', 'hand': 'right'|'left', 'grip': 'normal'|'reverse', "
+                                     "'length': <blade length in heads, default 3.2>, 'two_handed': true|false} and "
+                                     "{'type': 'scabbard', 'side': 'left'|'right', 'angle': 35, 'length': 3.4, "
+                                     "'sheathed': true|false}")
             base["props"] = v
         elif k in POSE_PARTS:
             if not isinstance(v, dict):
@@ -2509,6 +2525,7 @@ async def render_pose(pose: dict | str = "stand", view: str = "", facing: str = 
                       height: int = 0,
                       heads: float = 7, build: float = 1.0, shoulders: float = 1.0, hips: float = 1.0,
                       depth: bool | None = None, color_sides: bool = False, name: str = "", save_to: str = "",
+                      detail: list[str] | None = None, show: list[str] | None = None, parts: bool = False,
                       preview_size: int = 640) -> list:
     if depth is None:
         depth = _speed() == "full"
@@ -2542,7 +2559,8 @@ async def render_pose(pose: dict | str = "stand", view: str = "", facing: str = 
     while (POSES / f"{stem}.png").exists():
         stem += "x"
     job = {"name": stem, "width": w, "height": h, "samples": 24, "color_sides": bool(color_sides),
-           "outputs": ["mannequin", "depth"] if depth else ["mannequin"],
+           "outputs": ["mannequin"] + (["parts"] if parts else []) + (["depth"] if depth else []),
+           "detail": [str(d).lower() for d in detail or []], "show": _expand_parts(show or []),
            "figure": {"heads": heads, "build": build, "shoulders": shoulders, "hips": hips}, "pose": spec,
            "camera": {"azimuth": azimuth, "elevation": elevation, "distance": distance, "ortho": bool(ortho),
                       "margin": 0.06}}
@@ -2639,7 +2657,15 @@ render_pose.__doc__ = f"""Render a pose guide: a plain grey artist's mannequin i
     heads: figure height in heads (from the character's guide entry if it says; default 7). build, shoulders,
            hips: width multipliers (1 = average).
     depth: also write a depth map (near = white). Default: on at speed 'full' (generate_image then uses the depth
-           model), off at 'fast' / 'fastest'. color_sides: tint the left side blue and the right side warm,
+           model), off at 'fast' / 'fastest'.
+    detail: finer parts for precision work: "hands" (jointed fingers; per arm "hand": fist / grip / relaxed /
+            open / point, or "fingers": {{"index": [mcp, pip, dip], ..., "thumb": "wrap" | "open" | "relaxed"}}),
+            "feet" (hinged toes; leg key "toes"), "pelvis" (belt line, front marker, hip bones: shows its rotation),
+            "eyes" (eyeballs + pupils; head key "gaze": {{"up": deg, "left": deg}}, e.g. head down, eyes up).
+            Props also take {{"type": "scabbard", "side": "left", "angle": 35, "sheathed": true}}.
+    show: only these parts, framed on them (e.g. ["hands", "sword"]): a close-up mannequin of a detail.
+    parts: also write <name>-parts.png (each body part in its own flat colour; used for attention masks).
+    color_sides: tint the left side blue and the right side warm,
            only to check left/right yourself (don't pass that render to generate_image).
     save_to: main conversation only, when the user asks to keep a pose: saves it as a guide pose entry (mannequin
              as its primary reference plus the pose itself, re-renderable from any view).
@@ -3335,7 +3361,7 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
                      source: str = "", entries: list[str] | None = None, project: str = "", strength: float = 1.0,
                      redraw_strength: float = 0.9, reach: float = 0.3, candidates: int = 0, seed: int = -1,
                      steps: int = 4, guide: str = "", guide_strength: float = 1.0, fresh: bool = False,
-                     preview_size: int = 512) -> list:
+                     mask: str = "", preview_size: int = 512) -> list:
     """Edit ONLY the areas the user marked in red, instead of drawing a new image: everything outside the marks
     stays exactly as it was. Renders N candidates like generate_image: then pick_candidate and approve_image.
 
@@ -3373,19 +3399,29 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
     copies the original very closely, even at strength 1.0). Use it with strength 1.0 to REMOVE something (say
     what should be there instead: "the cape and the sky behind, no arm") or to really change it (bare skin that
     should be a fabric sleeve, missing armour details). The picture around the marks keeps the style.
+    mask: a mask image (white = redraw), e.g. an attention_mask, instead of red marks; needs source=. Each separate
+    white area is redrawn in its own crop.
     """
     global BUSY
     _open_for_request(project)
     if not 0.05 <= strength <= 1.0:
         raise ValueError("strength must be between 0.05 and 1.0")
-    an = await asyncio.to_thread(_analyze_marks, image)
+    if mask.strip():
+        an = {"marked_path": _image_path(mask), "regions": []}
+    else:
+        an = await asyncio.to_thread(_analyze_marks, image)
     regs = an["regions"]
-    if marks:
+    if marks and not mask.strip():
         bad = [m for m in marks if m not in [rg["number"] for rg in regs]]
         if bad:
             raise ValueError(f"no mark(s) {bad}; this image has marks 1-{len(regs)} (see find_marks)")
         regs = [rg for rg in regs if rg["number"] in marks]
-    if source.strip():
+    if mask.strip():
+        if not source.strip():
+            raise ValueError("mask= needs source= (the picture to edit)")
+        sp = _image_path(source)
+        src_img = PILImage.open(sp).convert("RGB")
+    elif source.strip():
         sp = _image_path(source)
         src_img = PILImage.open(sp).convert("RGB")
         # map the marks with this original's own match, if it appears in the marked image
@@ -3405,8 +3441,19 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
         sp = regs[0]["source"]["path"] if regs[0]["source"] else an["marked_path"]
         src_img = PILImage.open(sp).convert("RGB")
     W, H = src_img.size
-    masks = [await asyncio.to_thread(_source_mask, rg, rg["source"], W, H) for rg in regs]
-    greens = [_green_to_source(rg["green"], rg["source"]) if rg.get("green") else None for rg in regs]
+    if mask.strip():
+        import cv2
+        import numpy as np
+        mk = np.asarray(PILImage.open(an["marked_path"]).convert("L").resize((W, H), PILImage.NEAREST)) > 127
+        n_c, lab = cv2.connectedComponents(mk.astype(np.uint8))
+        masks = [((lab == i) * 255).astype(np.uint8) for i in range(1, n_c) if (lab == i).sum() > 64]
+        if not masks:
+            raise ValueError("the mask is empty")
+        regs = [{"number": i + 1} for i in range(len(masks))]
+        greens = [None] * len(masks)
+    else:
+        masks = [await asyncio.to_thread(_source_mask, rg, rg["source"], W, H) for rg in regs]
+        greens = [_green_to_source(rg["green"], rg["source"]) if rg.get("green") else None for rg in regs]
     if not instruction.strip() and not all(greens):
         raise ValueError("say what to change in the red marks (instruction), or add a green mark showing where "
                          "and which way the marked thing should go")
@@ -3544,6 +3591,344 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
             f"{checklist}\nOnly the marked areas changed; judge them (the before | after crops) for the "
             f"instruction, anatomy and seams. Then pick_candidate(request_id='{rid}', number=<best>).")
     return [head, *out]
+
+
+# ---------------------------------------------------------------- pose simulator + attention mask
+SIMS = SDIR / "sims"
+BODY_PARTS = ["head", "neck", "chest", "abdomen", "pelvis", "left_upper_arm", "left_forearm", "left_hand",
+              "right_upper_arm", "right_forearm", "right_hand", "left_thigh", "left_shin", "left_foot",
+              "right_thigh", "right_shin", "right_foot", "sword", "scabbard"]
+PART_ALIASES = {
+    "hands": ["left_hand", "right_hand"], "feet": ["left_foot", "right_foot"],
+    "left_arm": ["left_upper_arm", "left_forearm", "left_hand"],
+    "right_arm": ["right_upper_arm", "right_forearm", "right_hand"],
+    "arms": ["left_upper_arm", "left_forearm", "left_hand", "right_upper_arm", "right_forearm", "right_hand"],
+    "forearms": ["left_forearm", "right_forearm"],
+    "left_leg": ["left_thigh", "left_shin", "left_foot"], "right_leg": ["right_thigh", "right_shin", "right_foot"],
+    "legs": ["left_thigh", "left_shin", "left_foot", "right_thigh", "right_shin", "right_foot"],
+    "torso": ["chest", "abdomen", "pelvis"], "hips": ["pelvis"], "props": ["sword", "scabbard"],
+    "accessories": ["sword", "scabbard"], "body": BODY_PARTS, "all": BODY_PARTS}
+
+
+def _expand_parts(names) -> list[str]:
+    out = []
+    for n in names or []:
+        k = str(n).strip().lower().replace(" ", "_").replace("-", "_")
+        for g in PART_ALIASES.get(k, [k]):
+            if g not in BODY_PARTS:
+                raise ValueError(f"unknown part '{n}': use {', '.join(BODY_PARTS)} or {', '.join(PART_ALIASES)}")
+            if g not in out:
+                out.append(g)
+    return out
+
+
+def _sim(simulation: str = "") -> tuple[str, dict]:
+    sims = S.setdefault("sims", {})
+    sid = simulation.strip() or S.get("last_sim") or ""
+    if sid not in sims:
+        raise ValueError(f"no simulation '{sid or '(latest)'}' in this session. Simulations: "
+                         f"{', '.join(sims) or 'none'} (simulate_pose makes one)")
+    return sid, sims[sid]
+
+
+def _fit_place(joints: dict, bbox: list, place: dict | None, W: int, H: int, rw: int, rh: int):
+    """2x3 matrix: render pixels -> scene pixels."""
+    import numpy as np
+    if not place:
+        return np.array([[W / rw, 0, 0], [0, H / rh, 0]], float), "as framed"
+    if place.get("anchors"):
+        anc = place["anchors"]
+        bad = [k for k in anc if k not in joints]
+        if bad:
+            raise ValueError(f"unknown anchor(s) {bad}; anchors are mannequin points: {', '.join(sorted(joints))}")
+        names = list(anc)
+        src = np.array([joints[k] for k in names], float)
+        dst = np.array([anc[k] for k in names], float)
+        if len(names) == 1:
+            h = float(place.get("height") or 0)
+            if h <= 0:
+                raise ValueError("one anchor needs place.height (the figure's height in scene pixels)")
+            sc_ = h / max(1e-6, bbox[3] - bbox[1])
+            R = np.eye(2) * sc_
+        else:
+            sc0, dc0 = src.mean(0), dst.mean(0)
+            A, B = src - sc0, dst - dc0
+            if place.get("rotate"):
+                U, Sv, Vt = np.linalg.svd(B.T @ A / len(A))
+                D = np.diag([1, np.sign(np.linalg.det(U @ Vt)) or 1])
+                R = (np.trace(np.diag(Sv) @ D) / max(1e-9, (A ** 2).sum(1).mean())) * (U @ D @ Vt)
+            else:
+                R = np.eye(2) * ((A * B).sum() / max(1e-9, (A ** 2).sum()))
+        t = dst.mean(0) - R @ src.mean(0) if len(names) > 1 else dst[0] - R @ src[0]
+        return np.hstack([R, t[:, None]]), f"{len(names)} anchor(s)"
+    if place.get("box"):
+        x0, y0, x1, y1 = (float(v) for v in place["box"])
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        sc_ = min((x1 - x0) / max(bw, 1e-6), (y1 - y0) / max(bh, 1e-6))
+        t = np.array([(x0 + x1) / 2 - sc_ * (bbox[0] + bbox[2]) / 2, y1 - sc_ * bbox[3]])
+        return np.hstack([np.eye(2) * sc_, t[:, None]]), "fitted in the box (feet on its bottom edge)"
+    sc_ = float(place.get("scale", 1.0))
+    off = place.get("offset") or [0, 0]
+    return np.array([[sc_, 0, off[0]], [0, sc_, off[1]]], float), "scale/offset"
+
+
+def _png_bytes(im) -> bytes:
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _sim_overlay(scene, rgba, opacity: float, grid: bool, marks=()):
+    """The scene with the mannequin over it (bluish, semi-transparent, outlined), a light grid and anchor marks."""
+    import cv2
+    import numpy as np
+    from PIL import ImageDraw
+    sc_ = np.asarray(scene.convert("RGB"), np.float32)
+    a = rgba[..., 3:4] / 255.0
+    tint = rgba[..., :3] * np.array([0.78, 0.92, 1.18], np.float32)
+    out = sc_ * (1 - a * opacity) + np.clip(tint, 0, 255) * (a * opacity)
+    edge = cv2.morphologyEx((a[..., 0] > 0.5).astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    out[edge] = (30, 80, 200)
+    im = PILImage.fromarray(out.clip(0, 255).astype(np.uint8))
+    d = ImageDraw.Draw(im)
+    W, H = im.size
+    if grid:
+        for x in range(50, W, 50):
+            d.line([(x, 0), (x, H)], fill=(150, 150, 150) if x % 100 else (110, 110, 110), width=1)
+            if x % 100 == 0:
+                d.text((x + 2, 2), str(x), fill=(60, 60, 60))
+        for y in range(50, H, 50):
+            d.line([(0, y), (W, y)], fill=(150, 150, 150) if y % 100 else (110, 110, 110), width=1)
+            if y % 100 == 0:
+                d.text((2, y + 2), str(y), fill=(60, 60, 60))
+    for name, tgt, got in marks:
+        d.ellipse([tgt[0] - 6, tgt[1] - 6, tgt[0] + 6, tgt[1] + 6], outline=(220, 30, 30), width=2)
+        d.ellipse([got[0] - 3, got[1] - 3, got[0] + 3, got[1] + 3], fill=(30, 80, 220))
+        d.text((tgt[0] + 8, tgt[1] - 6), name, fill=(200, 20, 20))
+    return im
+
+
+@tool
+async def simulate_pose(pose: dict | str = "stand", scene: str = "", place: dict | None = None,
+                        detail: list[str] | None = None, show: list[str] | None = None, view: str = "",
+                        facing: str = "", azimuth: float | None = None, elevation: float | None = None,
+                        distance: float | None = None, mirror: bool = False, ortho: bool = False,
+                        aspect: str = "portrait", heads: float = 7, build: float = 1.0, shoulders: float = 1.0,
+                        hips: float = 1.0, simulation: str = "", opacity: float = 0.55, grid: bool = True,
+                        preview_size: int = 900) -> list:
+    """POSE SIMULATOR: before ANY image that creates or edits a character's position (pose, grip, placement,
+    adding a character to a scene), simulate it with the Blender mannequin placed in the scene, show the preview
+    to the user and ask whether the placement and every detail are right. Draw only when the user says so
+    (draw_simulation, through the image-picker).
+
+    pose, view, facing, azimuth, elevation, distance, mirror, ortho, heads, build, shoulders, hips: as render_pose.
+    scene: the picture the mannequin goes into (a path, a request id, 'latest' = the newest chat attachment), or
+           "" for a new image (a blank canvas of `aspect`). For an EDIT, place the mannequin over the character it
+           changes; for a NEW character in an existing picture, place it where it should stand.
+    place: where the mannequin goes in the scene (scene pixels; the preview has a grid every 50 px):
+           {"anchors": {"<mannequin point>": [x, y], ...}} - 2+ points (scale + position; "rotate": true also
+             turns it), or 1 point + "height" (figure height in px). Points: root, chest, neck, head, crown, chin,
+             nose, left_/right_ shoulder, elbow, wrist, hand_tip, fist (detail hands), hip, knee, ankle, toe,
+             pelvis_front, sword_guard, sword_pommel, sword_tip, scabbard_top.
+           {"box": [x0, y0, x1, y1]} - fit the figure in the box, feet on its bottom edge.
+           {"scale": s, "offset": [dx, dy]}. Default: as framed (fills the canvas).
+    detail: finer 3D parts for precision (the user asks for them, or they are what the request is about): "hands"
+            (jointed fingers; per arm "hand": fist / grip / relaxed / open / point, or "fingers"), "feet" (toes;
+            leg "toes"), "pelvis" (shows its rotation). Accessories are props: sword, scabbard (see render_pose).
+    show: render only these parts, framed on them (e.g. ["hands", "sword"] for a grip close-up), then anchor them
+          on the picture (e.g. sword_guard + sword_pommel on the drawn sword).
+    simulation: a name for it (default sim-<time>); simulating again with the same name replaces it.
+    Returns the preview (scene + mannequin, plus a close-up when the figure is small) and the mannequin points in
+    scene pixels. Refine (pose, detail, place) and simulate again until the user approves.
+    """
+    import re
+    import cv2
+    import numpy as np
+    if scene.strip():
+        sp = _image_path(scene)
+        sc_img = PILImage.open(sp).convert("RGB")
+    else:
+        sp = None
+        if aspect not in ASPECTS:
+            raise ValueError(f"unknown aspect '{aspect}'; use one of {list(ASPECTS)}")
+        sc_img = PILImage.new("RGB", ASPECTS[aspect], "white")
+    W, H = sc_img.size
+    sid = slugify(simulation) if simulation.strip() else f"sim-{dt.datetime.now():%H%M%S}"
+    res = await render_pose(pose=pose, view=view, facing=facing, azimuth=azimuth, elevation=elevation,
+                            distance=distance, mirror=mirror, ortho=ortho, width=W // 16 * 16, height=H // 16 * 16,
+                            heads=heads, build=build, shoulders=shoulders, hips=hips, depth=True, parts=True,
+                            detail=detail, show=show, name=f"{sid}-raw", preview_size=256)
+    stem = re.search(r"Pose guide '([^']+)'", res[0]).group(1)
+    info = _load(POSES / f"{stem}.json", {})
+    rw, rh = info["width"], info["height"]
+    M, how = _fit_place(info["joints_px"], info["figure_bbox_px"], place, W, H, rw, rh)
+    scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+    parts_rgba = np.asarray(PILImage.open(POSES / f"{stem}-parts.png").convert("RGBA"))
+    alpha = (parts_rgba[..., 3] > 127).astype(np.float32) * 255
+    mann = np.asarray(PILImage.open(POSES / f"{stem}.png").convert("RGB"), np.float32)
+    rgba = np.dstack([mann, alpha]).astype(np.float32)
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    rgba_w = cv2.warpAffine(rgba, M, (W, H), flags=interp, borderValue=0)
+    parts_w = cv2.warpAffine(parts_rgba, M, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+    dep = np.asarray(PILImage.open(POSES / f"{stem}-depth.png").convert("L"))
+    dep_w = cv2.warpAffine(dep, M, (W, H), flags=interp, borderValue=0)
+    SIMS.mkdir(parents=True, exist_ok=True)
+    on_white = rgba_w[..., :3] * (rgba_w[..., 3:4] / 255) + 255 * (1 - rgba_w[..., 3:4] / 255)
+    PILImage.fromarray(on_white.clip(0, 255).astype(np.uint8)).save(SIMS / f"{sid}.png")
+    PILImage.fromarray(rgba_w.clip(0, 255).astype(np.uint8), "RGBA").save(SIMS / f"{sid}-rgba.png")
+    PILImage.fromarray(parts_w, "RGBA").save(SIMS / f"{sid}-parts.png")
+    PILImage.fromarray(dep_w).save(SIMS / f"{sid}-depth.png")
+    joints = {k: [round(float(v), 1) for v in M @ np.array([x, y, 1.0])] for k, (x, y) in info["joints_px"].items()}
+    marks = []
+    if place and place.get("anchors"):
+        marks = [(k, v, joints[k]) for k, v in place["anchors"].items()]
+    meta = {"id": sid, "created": now_iso(), "scene": str(sp) if sp else None, "size": [W, H],
+            "pose": pose, "detail": detail or [], "show": show or [], "place": place, "matrix": M.tolist(),
+            "scale": round(scale, 4), "joints": joints, "parts": info.get("parts", {}),
+            "warnings": info.get("warnings", []), "render": stem}
+    _save(SIMS / f"{sid}.json", meta)
+    S.setdefault("sims", {})[sid] = meta
+    S["last_sim"] = sid
+    _save_session()
+    prev = _sim_overlay(sc_img, rgba_w, opacity, grid, marks)
+    out = [prev]
+    ys, xs = np.nonzero(rgba_w[..., 3] > 127)
+    if len(xs) and (ys.max() - ys.min() < 0.45 * H or show):
+        x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+        pad = int(max(x1 - x0, y1 - y0) * 0.35) + 10
+        box = (max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad))
+        z = _sim_overlay(sc_img.crop(box), rgba_w[box[1]:box[3], box[0]:box[2]], opacity, False)
+        k = 640 / max(z.size)
+        out.append(z.resize((int(z.width * k), int(z.height * k)), PILImage.LANCZOS))
+    err = ""
+    if marks:
+        err = " Anchor misfit (px): " + ", ".join(f"{k} {np.hypot(t[0] - g[0], t[1] - g[1]):.0f}" for k, t, g in marks)
+    key = {k: joints[k] for k in joints if k in ("crown", "chin", "chest", "root", "left_wrist", "right_wrist",
+                                                   "left_fist", "right_fist", "left_ankle", "right_ankle",
+                                                   "sword_guard", "sword_pommel", "sword_tip", "pelvis_front")}
+    text = (f"Simulation '{sid}' ({'scene ' + Path(sp).name if sp else 'new image'} {W}x{H}; placed: {how}, "
+            f"scale {scale:.3f}; detail: {', '.join(detail or []) or 'none'}"
+            f"{'; only ' + ', '.join(show) if show else ''}).{err}"
+            f"{' WARNING: ' + '; '.join(info['warnings']) if info.get('warnings') else ''}\n"
+            f"Mannequin points in scene pixels: {json.dumps(key)}\n"
+            "Show the preview to the user (blue = mannequin, red rings = anchors) and ask whether the placement and "
+            "every detail are right; offer detail parts (hands/fingers, pelvis, feet, accessories) where they "
+            "matter. Refine and simulate again until they approve. Only when they say to draw it: "
+            f"attention_mask('{sid}', parts=[...]) for an edit, then the image-picker calls "
+            f"draw_simulation('{sid}', instruction=..., entries=[...]).")
+    return [text, *(_preview(_png_bytes(im), preview_size) for im in out)]
+
+
+@tool
+async def attention_mask(simulation: str = "", parts: list[str] | None = None, old: str = "",
+                         old_parts: list[str] | None = None, extra: list[list] | None = None, grow: int = 0,
+                         connect: int = 0, preview_size: int = 900) -> list:
+    """ATTENTION MASK: every region a simulated change affects, worked out from the mannequin, so the redraw
+    covers all of it (and nothing is blurred or pre-filled): the chosen parts of the simulation, the bits of the
+    neighbouring parts that connect to them (wrists for hands, hips for legs...), the old pose's area when `old`
+    names a simulation fitted on the character as it is now, and `extra` boxes [x0, y0, x1, y1] or polygons
+    [[x, y], ...] in scene pixels (e.g. something that must be removed). parts: as simulate_pose's show (default:
+    the whole mannequin). grow: margin in px (default ~1.2% of the picture's diagonal). connect: how far into
+    neighbouring parts (default ~3%). Saves the mask with the simulation (draw_simulation uses it) and returns a
+    preview (red = redrawn) to show the user."""
+    import cv2
+    import numpy as np
+    sid, sim = _sim(simulation)
+    W, H = sim["size"]
+
+    def part_mask(meta, names):
+        P = np.asarray(PILImage.open(SIMS / f"{meta['id']}-parts.png").convert("RGBA")).astype(int)
+        a = P[..., 3] > 127
+        if not names:
+            return a
+        m = np.zeros(a.shape, bool)
+        for g in _expand_parts(names):
+            c = meta["parts"].get(g)
+            if c is not None:
+                m |= a & (np.abs(P[..., :3] - np.array(c)).max(-1) <= 3)
+        return m
+    sel = part_mask(sim, parts)
+    if not sel.any():
+        raise ValueError(f"none of {parts} is visible in simulation {sid} (its parts: {', '.join(sim['parts'])})")
+    whole = part_mask(sim, None)
+    diag = math.hypot(W, H)
+    connect = connect or int(diag * 0.03)
+    grow = grow or int(diag * 0.012) + 4
+    ell = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    m = sel | (cv2.dilate(sel.astype(np.uint8), ell(connect)).astype(bool) & whole)
+    if old.strip():
+        osid, osim = _sim(old)
+        if osim["size"] != sim["size"]:
+            raise ValueError("the old simulation is on a picture of another size")
+        m |= part_mask(osim, old_parts or parts)
+    for shape in extra or []:
+        if len(shape) == 4 and all(isinstance(v, (int, float)) for v in shape):
+            x0, y0, x1, y1 = (int(v) for v in shape)
+            m[max(0, y0):y1, max(0, x0):x1] = True
+        else:
+            poly = np.array(shape, np.int32).reshape(-1, 2)
+            tmp = np.zeros(m.shape, np.uint8)
+            cv2.fillPoly(tmp, [poly], 1)
+            m |= tmp.astype(bool)
+    m8 = cv2.dilate(m.astype(np.uint8), ell(grow))
+    m8 = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, ell(max(3, grow)))
+    path = SIMS / f"{sid}-mask.png"
+    PILImage.fromarray(m8 * 255).save(path)
+    sim["mask"] = str(path)
+    sim["mask_parts"] = parts or ["body"]
+    _save(SIMS / f"{sid}.json", sim)
+    _save_session()
+    scene = PILImage.open(sim["scene"]).convert("RGB") if sim.get("scene") else PILImage.new("RGB", (W, H), "white")
+    sc_ = np.asarray(scene, np.float32)
+    mk = m8.astype(bool)
+    sc_[mk] = sc_[mk] * 0.6 + np.array([235, 40, 40]) * 0.4
+    edge = cv2.morphologyEx(m8, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    sc_[edge] = (200, 0, 0)
+    medge = cv2.morphologyEx(whole.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    sc_[medge] = (30, 80, 200)
+    prev = PILImage.fromarray(sc_.clip(0, 255).astype(np.uint8))
+    area = 100 * mk.mean()
+    return [f"Attention mask of '{sid}': parts {', '.join(_expand_parts(parts) if parts else ['all'])}"
+            f"{' + old pose ' + old if old else ''}{' + ' + str(len(extra)) + ' extra area(s)' if extra else ''}, "
+            f"{area:.1f}% of the picture (grow {grow} px, connect {connect} px). Red = redrawn from scratch "
+            "following the mannequin; everything else stays exactly as it is. Show it to the user with the "
+            "simulation preview.", _preview(_png_bytes(prev), preview_size)]
+
+
+@tool
+async def draw_simulation(simulation: str = "", instruction: str = "", entries: list[str] | None = None,
+                          project: str = "", mask: str = "auto", candidates: int = 0, seed: int = -1,
+                          guide_strength: float = 1.0, preview_size: int = 512) -> list:
+    """Draw an approved simulation (image-picker only; the main conversation delegates). A new image (no scene):
+    generate_image with the placed mannequin and the depth model. An existing scene: a guided redraw of the
+    attention mask only (mask="auto" = the one saved by attention_mask, else the whole mannequin), drawn from
+    scratch following the mannequin's depth map; the rest of the picture is untouched (no blur, no pasted
+    mannequin). instruction: what to draw (the scene, action, clothing at the affected parts). Then
+    pick_candidate as usual."""
+    import numpy as np
+    sid, sim = _sim(simulation)
+    if not instruction.strip():
+        raise ValueError("say what to draw (instruction)")
+    W, H = sim["size"]
+    if not sim.get("scene"):
+        return await generate_image(prompt=instruction, entries=entries, project=project, width=W, height=H,
+                                    pose=str(SIMS / f"{sid}.png"), pose_mode="depth", candidates=candidates,
+                                    seed=seed, preview_size=preview_size)
+    mpath = mask if mask not in ("", "auto") else sim.get("mask")
+    if not mpath:
+        await attention_mask(sid)
+        mpath = sim["mask"]
+    dep = np.asarray(PILImage.open(SIMS / f"{sid}-depth.png").convert("L")).astype(np.float32)
+    a = np.asarray(PILImage.open(SIMS / f"{sid}-rgba.png").convert("RGBA"))[..., 3].astype(np.float32) / 255
+    fg = dep[a > 0.5]
+    lo, hi = (np.percentile(fg, 1), np.percentile(fg, 99.5)) if fg.size else (0, 255)
+    near = np.clip((dep - lo) / max(1.0, hi - lo), 0, 1)
+    guide = 0.33 * (1 - a) + (0.55 + 0.45 * near) * a        # the rest of the picture: one flat, farther plane
+    gpath = SIMS / f"{sid}-guide.png"
+    PILImage.fromarray((guide * 255).clip(0, 255).astype(np.uint8)).convert("RGB").save(gpath)
+    return await edit_image(instruction=instruction, image="", source=sim["scene"], mask=str(mpath),
+                            entries=entries, project=project, strength=1.0, candidates=candidates, seed=seed,
+                            guide=str(gpath), guide_strength=guide_strength, preview_size=preview_size)
 
 
 # ---------------------------------------------------------------- startup
