@@ -120,6 +120,15 @@ not draw a new image.
     his belt on a buckled strap".
   - Two settings: `reach` (default 0.3) sets how much of the body around the attachment is redrawn, and
     `redraw_strength` (default 0.9) sets how freely it is redrawn.
+- **Guided redraw (precision work with a mannequin):** `edit_image(guide=<depth map>, strength=1.0)`.
+  - The guide is a depth map (near = bright), the same size as the picture, of a Blender mannequin placed
+    exactly where something must go. For example, two hands in a correct two-handed grip, lined up with the
+    sword and bracers already in the picture.
+  - The marked area is drawn from scratch with the depth LoRA, following the guide. The model is never shown
+    the original inside the mark, so it can't copy the old shape. The mannequin is never pasted into the
+    picture, and nothing is blurred.
+  - Why this exists: a plain edit copies what is inside the mark very closely, even at strength 1.0. It can
+    clean up a shape, but it can't change one much.
 
 ## Pose guides (Blender)
 
@@ -144,14 +153,27 @@ copies the pose of any full-body figure it is shown.
 - **Outputs:** a depth map on request, and the 2D joint positions in a JSON file.
 - **Keeping poses:** "Save this pose as *the draw*" stores it in the project guide as a pose entry. It can be
   re-rendered from any angle and used as `entries=["pose/the draw"]`.
-- **Depth mode:** `generate_image(pose=..., pose_mode="depth")` uses the
+- **Depth mode (the default):** `generate_image(pose=...)` uses the
   [RefControl depth LoRA](https://huggingface.co/thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora)
   (Apache 2.0, 92 MB; `setup.py` downloads it).
-  - Image 1 is the pose's depth map (`render_pose(..., depth=True)`), and image 2 is the character's full
+  - Image 1 is the pose's depth map (`render_pose` writes it by default), and image 2 is the character's full
     reference.
   - It follows the silhouette even more tightly than the mannequin guide, and identity holds.
-  - In our tests, props such as a sheathed sword come out weaker. Use the default `guide` mode when props
-    matter.
+  - In our tests, props such as a sheathed sword can come out weaker. `pose_mode="guide"` sends the mannequin
+    as a plain pose reference instead.
+
+**Every character image uses a pose guide.** By default, every image with a character is drawn from a
+mannequin pose guide with the depth model. A character request without a pose is refused, except with
+`pose="none"`, which is for images one mannequin can't pose: several characters, a face close-up, or Blender
+not set up. Ask Claude for faster images and it lowers the session speed one step at a time with `set_speed`:
+
+| Speed | Pose guide | Depth model |
+|---|---|---|
+| `full` (default) | yes | yes |
+| `fast` | yes | no: the mannequin is sent as a plain pose reference |
+| `fastest` | no | no |
+
+`set_speed("full")` or `clear_session` goes back to the default.
 
 **Where Blender comes from:** a small Docker image, `docker/Dockerfile.blender`. It downloads the **official
 portable Linux build** of Blender (5.2 LTS) from download.blender.org and checks its SHA-256, so nothing is

@@ -175,6 +175,13 @@ MODEL = {  # FLUX.2 klein 4B (distilled, Apache 2.0)
     **(CFG.get("model") or {}),
 }
 DEPTH_LORA_REPO = "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora"
+# Session speed (set_speed): how character images are posed. Lower only when the user asks for faster images.
+SPEEDS = {
+    "full": "every character image is drawn from a Blender mannequin pose guide with the depth model",
+    "fast": "mannequin pose guide sent as a plain reference (depth model off)",
+    "fastest": "no mannequin pose guide (depth model off)",
+}
+DEFAULT_SPEED = "full"
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 ASPECTS = {
     "portrait": (896, 1152), "square": (1024, 1024), "landscape": (1152, 896),
@@ -993,8 +1000,11 @@ def _depth_of(pose_r: dict) -> dict:
     p = Path(pose_r["path"])
     d = p if p.stem.endswith("-depth") else p.with_name(f"{p.stem}-depth.png")
     if not d.is_file():
-        raise ValueError(f"pose_mode='depth' needs the pose's depth map ({d.name}): render the pose with "
-                         "render_pose(..., depth=True) and pass that mannequin")
+        raise ValueError(f"the depth model (pose_mode 'depth', the default at speed 'full') needs the pose's depth "
+                         f"map ({d.name}): render the pose with render_pose (a guide pose entry: "
+                         "render_pose(pose='<entry name>')); it writes the depth map at speed 'full' "
+                         "(or pass depth=True), then pass that mannequin. For a pose image that isn't a mannequin, "
+                         "pass pose_mode='guide'")
     return {"path": d, "source": f"depth map {d.stem}",
             "legend": "the depth map of the pose to use (near = bright): copy its pose, body proportions and "
                       "camera angle"}
@@ -1117,6 +1127,11 @@ def _candidate_count() -> int:
     return S["candidates"] or DEFAULT_CANDIDATES
 
 
+def _speed() -> str:
+    s = S.get("speed")
+    return s if s in SPEEDS else DEFAULT_SPEED
+
+
 def _open_request(request_id: str) -> tuple[str, dict]:
     rid = request_id or S["last_request"]
     if not rid or rid not in S["requests"]:
@@ -1173,18 +1188,28 @@ mcp = MCPServer(
         "explicitly asks. When the user likes the pick, call approve_image; discard_image drops it. End with one "
         "short line that the image session is still up and they can ask you to clear it (clear_session); no "
         "explanation about ComfyUI or Ollama.\n\n"
-        "POSE GUIDES. render_pose draws a grey mannequin in a pose with Blender (presets + joint angles, any camera "
-        "angle); the image-picker uses it for action and acrobatic poses via generate_image(pose=...). If it says "
-        "Blender isn't set up, call setup_blender() (builds a small Docker image from the official Blender build) "
-        "or, without Docker, setup_blender(path=<installed blender>); blender_status shows the state. When the "
-        "user wants to keep a pose, render_pose(..., save_to='<name>') saves it as a guide pose entry.\n\n"
+        "POSE GUIDES AND SPEED. render_pose draws a grey mannequin in a pose with Blender (presets + joint angles, "
+        "any camera angle). By default (speed 'full') EVERY image with a character is drawn from a mannequin pose "
+        "guide with the depth model: the image-picker renders the pose (render_pose writes the depth map by "
+        "default) and generate_image(pose=...) uses the depth model automatically; a character request without a "
+        "pose is refused. Lower the speed ONLY when the user asks for faster images, one step per request: "
+        "set_speed('fast') turns the depth model off (the mannequin is sent as a plain pose reference); if they "
+        "insist on even faster, set_speed('fastest') also skips the mannequin. set_speed('full') goes back; "
+        "clear_session resets it. When the speed isn't 'full', say so in the image-picker request. If render_pose "
+        "says Blender isn't set up, call setup_blender() (builds a small Docker image from the official Blender "
+        "build) or, without Docker, setup_blender(path=<installed blender>); blender_status shows the state. When "
+        "the user wants to keep a pose, render_pose(..., save_to='<name>') saves it as a guide pose entry.\n\n"
         "EDITS FROM RED MARKS. When the user attaches an image with red marks (drawn with the Claude app's pen) "
         "and asks for changes, edit only the marked areas, never draw a new image: call find_marks('latest') to "
         "see the numbered marks and the original each is on, then delegate to the image-picker with the project, "
         "the marked image's path, and one instruction per mark (it calls edit_image). A green line or loop next "
         "to a red mark means: put the red-marked thing there, pointing that way (the model removes it and redraws "
         "the connected region with it in place; name it and how it attaches in the instruction). Everything outside the marks stays as it was; approve_image files the edited "
-        "version."
+        "version. PRECISION WORK WITH MANNEQUINS (e.g. a trustworthy grip on an existing image): place a Blender "
+        "mannequin exactly (render_pose, or a custom Blender render), make its depth map lined up with the picture, "
+        "and edit with edit_image(guide=<depth map>, strength=1.0): the model redraws the marked area from "
+        "scratch following the guide. Never paste, trace or blend mannequin pixels into the picture, and never "
+        "blur or smudge areas: without a guide, edit_image copies what is inside the mark very closely."
     ),
 )
 
@@ -1637,7 +1662,7 @@ def _open_for_request(project: str):
 async def generate_image(prompt: str, entries: list[str] | None = None, project: str = "", aspect: str = "portrait",
                          width: int = 0, height: int = 0, seed: int = -1, candidates: int = 0,
                          use_references: bool = True, reference_mode: str = "style", use_default_style: bool = True,
-                         pose: str = "", pose_crop: bool = True, pose_mode: str = "guide",
+                         pose: str = "", pose_crop: bool = True, pose_mode: str = "",
                          lora_strength: float = 1.0, steps: int = 4, preview_size: int = 512,
                          dry_run: bool = False) -> list:
     """Render N candidate images for one request with FLUX.2 klein 4B (local ComfyUI). You then MUST call
@@ -1659,10 +1684,15 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     pose: a pose guide that sets the body pose: a render_pose mannequin (its path or name), any pose image, or a
           guide pose entry. Full-length character, creature and style references are then cropped to head and
           chest (pose_crop=False keeps them whole), because a full-body figure makes the model copy its pose.
-    pose_mode: 'guide' (default) sends the grey mannequin as the pose reference. 'depth' uses the RefControl
-          depth LoRA instead: image 1 = the pose's depth map (render_pose(..., depth=True)), then the full
-          character/creature references (not cropped); other references are left out and the trigger word is
-          added. lora_strength: 0.8-1.0 (lower keeps more of the reference's look).
+          REQUIRED for every request with a character entry unless the session speed is 'fastest': render the
+          pose with render_pose first. pose='none' skips it only when one mannequin can't pose the image
+          (several characters, a face close-up, Blender not set up); say why in your note.
+    pose_mode: '' (default) follows the session speed: 'full' = 'depth', 'fast' / 'fastest' = 'guide'. Don't
+          set it unless the user asked for a specific mode. 'guide' sends the grey mannequin as the pose
+          reference. 'depth' uses the RefControl depth LoRA: image 1 = the pose's depth map (render_pose writes
+          it by default at speed 'full'), then the full character/creature references (not cropped); other
+          references are left out and the trigger word is added. lora_strength: 0.8-1.0 (lower keeps more of the
+          reference's look).
     Max 4 reference images per image: attached ones first, then the pose guide, characters/creatures, style,
     locations, props.
     dry_run: only return the composed prompt, references and checklist (nothing is rendered).
@@ -1679,17 +1709,35 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     w, h = (max(256, min(2048, v)) // 16 * 16 for v in (w, h))
     if reference_mode not in ("style", "edit"):
         raise ValueError("reference_mode must be 'style' or 'edit'")
+    speed = _speed()
+    no_pose = pose.strip().lower() == "none"
+    if no_pose:
+        pose = ""
+    if not pose_mode:
+        pose_mode = "depth" if pose.strip() and speed == "full" else "guide"
     if pose_mode not in ("guide", "depth"):
-        raise ValueError("pose_mode must be 'guide' or 'depth'")
+        raise ValueError("pose_mode must be 'guide' or 'depth' (or '' to follow the session speed)")
     plan = _plan(prompt, entries or [], use_references, reference_mode, use_default_style, pose, pose_crop,
                  pose_mode)
+    chars = [e["name"] for e in plan["entries"] if e["kind"] == "character"]
+    if chars and not pose.strip() and not no_pose and speed != "fastest":
+        raise ValueError(
+            f"POSE_REQUIRED: at speed '{speed}' every character image is drawn from a mannequin pose guide "
+            f"({', '.join(chars)} is in this request). Call render_pose first"
+            f"{' (it writes the depth map)' if speed == 'full' else ''}, then pass "
+            "generate_image(pose=<mannequin path>). pose='none' only when one mannequin can't pose the image "
+            "(several characters, a face close-up, Blender not set up). Only the user lowers the speed (set_speed).")
+    if no_pose and chars:
+        plan["notes"].append("no pose guide (pose='none')")
     lora = MODEL.get("depth_lora") if pose_mode == "depth" else None
     checklist = ("\nChecklist (judge the candidates against it):\n" + "\n".join(f"- {c}" for c in plan["checklist"])
                  if plan["checklist"] else "")
     ref_lines = "\n".join(f"  image {i}: {r['source']}" for i, r in enumerate(plan["refs"], 1)) or "  none"
     notes = ("\nNotes: " + "; ".join(plan["notes"])) if plan["notes"] else ""
+    posing = (f"speed {speed}, pose: " + ({"depth": "mannequin + depth model", "guide": "mannequin guide"}[pose_mode]
+                                         if pose.strip() else "none"))
     if dry_run:
-        return [f"DRY RUN for {_mode_text()} ({w}x{h}).\nReferences:\n{ref_lines}{notes}{checklist}\n\n"
+        return [f"DRY RUN for {_mode_text()} ({w}x{h}, {posing}).\nReferences:\n{ref_lines}{notes}{checklist}\n\n"
                 f"Full prompt:\n{plan['text']}"]
     n = max(1, min(MAX_CANDIDATES, candidates or _candidate_count()))
     BUSY += 1
@@ -1727,7 +1775,8 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
         BUSY -= 1
     meta = {"request_id": rid, "created": now_iso(), "project": plan["project"], "prompt": prompt,
             "full_prompt": plan["text"], "entries": plan["entries"], "checklist": plan["checklist"],
-            "width": w, "height": h, "steps": steps, "model": MODEL, "pose_mode": pose_mode if pose else None,
+            "width": w, "height": h, "steps": steps, "model": MODEL, "speed": speed,
+            "pose_mode": pose_mode if pose else None,
             "lora": {"name": lora, "strength": lora_strength} if lora else None,
             "reference_mode": reference_mode if plan["refs"] else None,
             "references": [{"source": r["source"], **({"file": r["file"]} if r.get("file") else {})}
@@ -1738,7 +1787,7 @@ async def generate_image(prompt: str, entries: list[str] | None = None, project:
     S["last_request"] = rid
     _save_session()
     head = (f"{'[' + startup + '] ' if startup else ''}Request {rid} ({_mode_text()}): {n} candidates, {w}x{h}, "
-            f"{time.monotonic() - t_all:.0f} s total.\nReferences:\n{ref_lines}{notes}{checklist}\n"
+            f"{posing}, {time.monotonic() - t_all:.0f} s total.\nReferences:\n{ref_lines}{notes}{checklist}\n"
             f"Now call pick_candidate(request_id='{rid}', number=<best>). Present only the picked image; "
             "do not show or mention the other candidates unless the user asks.")
     return [head, *out]
@@ -1857,21 +1906,39 @@ async def set_candidate_count(count: int) -> str:
 
 
 @tool
+async def set_speed(level: str) -> str:
+    """Make images faster ONLY when the user asks for it (default 'full'). Kept until clear_session.
+    'full': every character image is drawn from a Blender mannequin pose guide with the depth model (best poses).
+    'fast': the user asked for faster images: the depth model is off, the mannequin is sent as a plain pose
+            reference (the style reference is used again).
+    'fastest': the user insisted on even faster: no mannequin either (saves the Blender render, ~15 s per pose).
+    Lower one step per request; go back with set_speed('full')."""
+    lv = level.strip().lower()
+    if lv not in SPEEDS:
+        raise ValueError(f"level must be one of {', '.join(SPEEDS)}")
+    S["speed"] = lv
+    _save_session()
+    return f"Speed '{lv}' for this session: {SPEEDS[lv]}. Tell the image-picker the speed in its requests."
+
+
+@tool
 async def clear_session(stop: bool = True) -> str:
-    """Start fresh: discard this session's unapproved images, detach references, reset the candidate count, close
-    the project (the next request asks again which project) and, if stop, stop ComfyUI and reload the Ollama
-    models (only when no other Claude session is still using them). Projects, guides and approved images are kept."""
+    """Start fresh: discard this session's unapproved images, detach references, reset the candidate count and the
+    speed, close the project (the next request asks again which project) and, if stop, stop ComfyUI and reload the
+    Ollama models (only when no other Claude session is still using them). Projects, guides and approved images are
+    kept."""
     if BUSY:
         raise ValueError("an image is still being generated in this session; clear when it has finished")
     n_open = len(S["requests"])
     for rid in list(S["requests"]):
         _close_request(rid, delete_selected=True)
     prev = _mode_text()
-    S.update(active=[], candidates=None, last_request=None, project=None, scratch=False, poses=[])
+    S.update(active=[], candidates=None, last_request=None, project=None, scratch=False, poses=[], speed=None)
     shutil.rmtree(POSES, ignore_errors=True)
     _save_session()
     msg = (f"Session cleared ({prev} closed): {n_open} unapproved image(s) discarded, references detached, "
-           f"{DEFAULT_CANDIDATES} candidates per request. The next request will ask which project to use.")
+           f"{DEFAULT_CANDIDATES} candidates per request, speed '{DEFAULT_SPEED}'. The next request will ask which "
+           "project to use.")
     if stop:
         msg += " " + await asyncio.to_thread(_stop_sync, True, False)
     else:
@@ -2441,8 +2508,10 @@ async def render_pose(pose: dict | str = "stand", view: str = "", facing: str = 
                       mirror: bool = False, ortho: bool = False, aspect: str = "portrait", width: int = 0,
                       height: int = 0,
                       heads: float = 7, build: float = 1.0, shoulders: float = 1.0, hips: float = 1.0,
-                      depth: bool = False, color_sides: bool = False, name: str = "", save_to: str = "",
+                      depth: bool | None = None, color_sides: bool = False, name: str = "", save_to: str = "",
                       preview_size: int = 640) -> list:
+    if depth is None:
+        depth = _speed() == "full"
     proj_needed = bool(save_to.strip())
     if proj_needed and not S.get("project"):
         raise ValueError(NO_PROJECT)
@@ -2499,11 +2568,15 @@ async def render_pose(pose: dict | str = "stand", view: str = "", facing: str = 
     S["poses"] = [*S.get("poses", [])[-50:], str(png)]
     _save_session()
     files = [f"mannequin: {png}"] + ([f"depth: {POSES / (stem + '-depth.png')}"] if depth else [])
+    speed = _speed()
+    nxt = {"full": "generate_image then uses the depth model (leave pose_mode unset).",
+           "fast": "generate_image sends it as a plain pose reference (speed 'fast', the user asked for it).",
+           "fastest": "speed is 'fastest' (the user asked to skip mannequins): use it only if the request asks."}
     msg = [f"{'[' + '; '.join(notes) + '] ' if notes else ''}Pose guide '{stem}' ({w}x{h}, azimuth "
            f"{azimuth:g}, elevation {elevation:g}, {time.monotonic() - t0:.0f} s).", *files,
            "Look at it: check limbs, sides (color_sides=True tints the left side blue, the right warm), "
            "the sword angle and balance; adjust and render again if needed. Then pass the mannequin path as "
-           "generate_image(pose=...)."]
+           f"generate_image(pose=...); {nxt[speed]}"]
     if save_to.strip():
         proj, _ = current()
         with _plock(proj):
@@ -2529,8 +2602,9 @@ async def render_pose(pose: dict | str = "stand", view: str = "", facing: str = 
 
 
 render_pose.__doc__ = f"""Render a pose guide: a plain grey artist's mannequin in the given pose, on white, with
-    Blender. Use it for action, combat and acrobatic poses, where the image model easily mixes up limbs: render
-    the pose, look at it, fix it, then pass the mannequin path to generate_image(pose=...). Renders take ~5-10 s.
+    Blender. Use it for EVERY image with a character (required unless the session speed is 'fastest'), not only
+    action poses: render the pose, look at it, fix it, then pass the mannequin path to generate_image(pose=...).
+    Renders take ~5-15 s.
 
     pose: a preset name, or an object: {{"preset": "<name>", ...overrides}} or a full pose. Presets:
           {"; ".join(f"{k} ({v.get('_about', '')})" for k, v in _pose_presets().items())}.
@@ -2564,7 +2638,8 @@ render_pose.__doc__ = f"""Render a pose guide: a plain grey artist's mannequin i
     aspect / width / height: use the same as the image you will generate.
     heads: figure height in heads (from the character's guide entry if it says; default 7). build, shoulders,
            hips: width multipliers (1 = average).
-    depth: also write a depth map (near = white). color_sides: tint the left side blue and the right side warm,
+    depth: also write a depth map (near = white). Default: on at speed 'full' (generate_image then uses the depth
+           model), off at 'fast' / 'fastest'. color_sides: tint the left side blue and the right side warm,
            only to check left/right yourself (don't pass that render to generate_image).
     save_to: main conversation only, when the user asks to keep a pose: saves it as a guide pose entry (mannequin
              as its primary reference plus the pose itself, re-renderable from any view).
@@ -3087,7 +3162,7 @@ async def _redraw_once(c: httpx.AsyncClient, base, mv: dict, text: str, seed: in
 
 def build_edit_workflow(prompt: str, img_name: str, mask_name: str, ref_names: list[str], w: int, h: int,
                         seed: int, steps: int, strength: float, context_name: str | None = None,
-                        no_context: bool = False):
+                        no_context: bool = False, lora: str | None = None, lora_strength: float = 1.0):
     total = steps if strength >= 0.999 else max(steps + 1, int(math.ceil(steps / max(0.05, strength))))
     wf = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": MODEL["unet"], "weight_dtype": "default"}},
@@ -3099,12 +3174,15 @@ def build_edit_workflow(prompt: str, img_name: str, mask_name: str, ref_names: l
         "7": {"class_type": "Flux2Scheduler", "inputs": {"steps": total, "width": w, "height": h}},
         "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
         "9": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-        "21": {"class_type": "DifferentialDiffusion", "inputs": {"model": ["1", 0]}},
+        "21": {"class_type": "DifferentialDiffusion", "inputs": {"model": ["20", 0] if lora else ["1", 0]}},
         "30": {"class_type": "LoadImage", "inputs": {"image": img_name}},
         "31": {"class_type": "VAEEncode", "inputs": {"pixels": ["30", 0], "vae": ["3", 0]}},
         "32": {"class_type": "LoadImageMask", "inputs": {"image": mask_name, "channel": "red"}},
         "33": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["31", 0], "mask": ["32", 0]}},
     }
+    if lora:
+        wf["20"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": lora,
+                                                                    "strength_model": lora_strength}}
     pos, neg = ["4", 0], ["5", 0]
     images = ref_names if no_context else [context_name or img_name, *ref_names]
     for i, name in enumerate(images):   # image 1 = the picture, as context (unless no_context: plain inpainting)
@@ -3153,7 +3231,8 @@ def _edit_box(mask, W: int, H: int) -> tuple[int, int, int, int]:
 
 
 async def _edit_once(c: httpx.AsyncClient, base, mask, text: str, ref_names: list[str], seed: int, steps: int,
-                     strength: float, before=None, redraw=None, no_context: bool = False):
+                     strength: float, before=None, redraw=None, no_context: bool = False, guide=None,
+                     guide_strength: float = 1.0):
     """Repaint one marked area of base (PIL RGB); returns the new full image and the area's box. The mask's grey
     levels say how much each pixel may change (differential diffusion). redraw: areas (uint8 mask) that are
     blurred in the image-1 reference, because the model copies a sharp reference pixel for pixel (a rough
@@ -3194,6 +3273,8 @@ async def _edit_once(c: httpx.AsyncClient, base, mask, text: str, ref_names: lis
         imgs.append(png(context))
     if before is not None:
         imgs.append(png(before.crop((x0, y0, x1, y1)).resize((cw, ch), PILImage.LANCZOS)))
+    if guide is not None:  # guided redraw: the marked area is drawn from scratch, following the depth map
+        imgs.append(png(guide.crop((x0, y0, x1, y1)).resize((cw, ch), PILImage.LANCZOS)))
     for data in imgs:
         name = hashlib.sha1(data).hexdigest()[:12] + ".png"
         r = await c.post(f"{COMFY}/upload/image", files={"image": (name, data, "image/png")},
@@ -3203,8 +3284,13 @@ async def _edit_once(c: httpx.AsyncClient, base, mask, text: str, ref_names: lis
         names.append(f"{j['subfolder']}/{j['name']}" if j.get("subfolder") else j["name"])
     ctx_name = names[2] if context is not None else None
     extra = names[3:] if context is not None else names[2:]
-    out = await run_workflow(c, build_edit_workflow(text, names[0], names[1], extra + ref_names, cw, ch, seed,
-                                                    steps, strength, ctx_name, no_context))
+    if guide is not None:
+        wf = build_edit_workflow(text, names[0], names[1], [names[-1], *ref_names], cw, ch, seed, steps, strength,
+                                 None, True, MODEL.get("depth_lora"), guide_strength)
+    else:
+        wf = build_edit_workflow(text, names[0], names[1], extra + ref_names, cw, ch, seed, steps, strength,
+                                 ctx_name, no_context)
+    out = await run_workflow(c, wf)
     new = PILImage.open(io.BytesIO(out)).convert("RGB").resize((bw, bh), PILImage.LANCZOS)
     pasted = PILImage.composite(new, crop, PILImage.fromarray(comp_m))
     result = base.copy()
@@ -3248,7 +3334,8 @@ async def find_marks(image: str = "latest", preview_size: int = 900) -> list:
 async def edit_image(instruction: str = "", image: str = "latest", marks: list[int] | None = None,
                      source: str = "", entries: list[str] | None = None, project: str = "", strength: float = 1.0,
                      redraw_strength: float = 0.9, reach: float = 0.3, candidates: int = 0, seed: int = -1,
-                     steps: int = 4, preview_size: int = 512) -> list:
+                     steps: int = 4, guide: str = "", guide_strength: float = 1.0, fresh: bool = False,
+                     preview_size: int = 512) -> list:
     """Edit ONLY the areas the user marked in red, instead of drawing a new image: everything outside the marks
     stays exactly as it was. Renders N candidates like generate_image: then pick_candidate and approve_image.
 
@@ -3275,6 +3362,17 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
     thing's length (0.3; larger redraws more of the body around it).
     Each mark is repainted in a crop around it at ~1 MP (so small things like hands get detail) and pasted
     back with a soft edge. ~10-15 s per mark per candidate.
+    GUIDED REDRAW (precision work with a mannequin): guide = a depth map (near = bright) lined up with the
+    original (same size, or resized to it), e.g. a Blender mannequin of the hands placed where they must be.
+    The marked areas are then drawn FROM SCRATCH by the model with the depth LoRA, following the guide's shapes
+    and layout: the original inside the marks is not shown to the model (so it can't copy what was there) and
+    the mannequin is never pasted into the picture; outside the marks nothing changes. Use strength 1.0 and mark
+    the whole area to redraw (the old part and where the new one goes). guide_strength: the LoRA strength (1.0;
+    0.8 follows the guide more loosely). No green marks with a guide.
+    fresh: redraw the marked areas from scratch, without showing the model what is inside them (it otherwise
+    copies the original very closely, even at strength 1.0). Use it with strength 1.0 to REMOVE something (say
+    what should be there instead: "the cape and the sky behind, no arm") or to really change it (bare skin that
+    should be a fabric sleeve, missing armour details). The picture around the marks keeps the style.
     """
     global BUSY
     _open_for_request(project)
@@ -3314,6 +3412,13 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
                          "and which way the marked thing should go")
     if _same_path(sp, an["marked_path"]):  # editing the attached picture itself: paint the pen strokes out first
         src_img = await asyncio.to_thread(_clean_red, src_img)
+    guide_img = None
+    if guide.strip():
+        if any(greens):
+            raise ValueError("a guide can't be combined with green marks: edit the moved thing first, then guide")
+        guide_img = PILImage.open(_image_path(guide)).convert("RGB")
+        if guide_img.size != (W, H):
+            guide_img = guide_img.resize((W, H), PILImage.LANCZOS)
     plan = _plan("", entries or [], False, "style", True)   # only the entries' descriptions + checklist
     char_refs = []
     if S.get("project") and entries:
@@ -3325,6 +3430,21 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
                 char_refs.append({"path": e["_dir"] / pr["file"], "source": _eid(e),
                                   "legend": ROLE_TEXT.get(e["kind"], "{name}").format(name=e["name"])})
     def mark_text() -> str:
+        if guide_img is not None:
+            legend = " ".join(["Image 1 shows the depth map of what to draw in the redrawn area (near = bright): "
+                               "follow its shapes, pose and layout exactly (finger positions, grip, angles), but "
+                               "draw it as part of the picture, not as a grey shape."] +
+                              [f"Image {i} shows {r['legend']}." for i, r in enumerate(char_refs, 2)])
+            return "\n\n".join(x for x in [
+                "refcontrol", f"Redraw the masked area of the picture: {instruction.strip().rstrip('.')}. Match the "
+                "art style, linework, colours and lighting of the rest of the picture exactly, and connect cleanly "
+                "to what is around the area.", plan["text"], f"Reference images: {legend}"] if x)
+        if fresh:
+            legend = " ".join(f"Image {i} shows {r['legend']}." for i, r in enumerate(char_refs, 1))
+            return "\n\n".join(x for x in [
+                f"Redraw the masked area of the picture: {instruction.strip().rstrip('.')}. Match the art style, "
+                "linework, colours and lighting of the rest of the picture exactly, and connect cleanly to what is "
+                "around the area.", plan["text"], f"Reference images: {legend}" if legend else ""] if x)
         legend = " ".join([f"Image 1 shows {EDIT_LEGEND}."] +
                           [f"Image {i} shows {r['legend']}." for i, r in enumerate(char_refs, 2)])
         return "\n\n".join(x for x in [
@@ -3381,7 +3501,9 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
                                                       redraw_strength)
                         box = (min(box[0], box1[0]), min(box[1], box1[1]), max(box[2], box1[2]), max(box[3], box1[3]))
                     else:
-                        img, box = await _edit_once(c, img, m, mark_text(), ref_names, s, steps, strength)
+                        img, box = await _edit_once(c, img, m, mark_text(), ref_names, s, steps, strength,
+                                                    no_context=fresh, guide=guide_img,
+                                                    guide_strength=guide_strength)
                     boxes.append(box)
                 buf = io.BytesIO()
                 img.save(buf, "PNG")
@@ -3404,6 +3526,7 @@ async def edit_image(instruction: str = "", image: str = "latest", marks: list[i
             "width": W, "height": H, "steps": steps, "model": MODEL,
             "edit": {"source": str(sp), "marked": str(an["marked_path"]), "marks": [rg["number"] for rg in regs],
                      "strength": strength, "moves": sorted(set(moves)) or None,
+                     "guide": str(_image_path(guide)) if guide.strip() else None, "fresh": fresh or None,
                      "redraw_strength": redraw_strength if any(greens) else None,
                      "reach": reach if any(greens) else None},
             "references": [{"source": "edited image"}, *({"source": r["source"]} for r in char_refs)],

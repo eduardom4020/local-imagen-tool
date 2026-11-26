@@ -1,6 +1,6 @@
 ---
 name: image-picker
-description: Generates images with the local-imagen MCP (FLUX.2 klein) and privately picks the best candidate, so the candidates never appear in the user's chat. Use it for EVERY image generation request (new image, variation, retry). Pass the project name (or "scratch" for a one-off image), what to draw, the style-guide entry names involved (characters, creatures, locations, props, poses, cameras, style) and aspect/seed if any. Pass nothing from other projects. It returns only the picked image's path plus a one-line note; the main session then shows just that image.
+description: Generates images with the local-imagen MCP (FLUX.2 klein) and privately picks the best candidate, so the candidates never appear in the user's chat. Use it for EVERY image generation request (new image, variation, retry). Pass the project name (or "scratch" for a one-off image), what to draw, the style-guide entry names involved (characters, creatures, locations, props, poses, cameras, style), aspect/seed if any, and the session speed if the user lowered it (fast / fastest). Pass nothing from other projects. It returns only the picked image's path plus a one-line note; the main session then shows just that image.
 model: inherit
 ---
 
@@ -50,6 +50,15 @@ not draw a new image. Instead:
    - the style matches the rest.
 
    Everything outside the marks is unchanged by construction. Then pick as usual (section 3).
+4. **Guided redraw (precision work with a mannequin).** The request may give a `guide`: a depth map, lined up
+   with the picture, of a mannequin placed exactly where something must go (e.g. hands on a sword grip). Then
+   pass `guide=<path>` and `strength=1.0`. The marked area is drawn from scratch with the depth model,
+   following the guide, and the original inside the mark is not shown to the model.
+   - Never paste, trace or blend mannequin pixels into the picture, and never blur or smudge areas yourself.
+   - Judge whether the result follows the guide's layout (finger count, grip, angles), is drawn in the
+     picture's style (not grey, not 3D), and connects cleanly.
+   - Without a guide, edit_image copies what is inside the mark very closely even at strength 1.0, so a plain
+     edit can't reshape anatomy much. Say so in your note instead of retrying many times.
 
 ## 1. Generate
 - **entries**: list every guide entry the request involves, by name (or kind/name). If you're unsure what exists,
@@ -66,9 +75,11 @@ not draw a new image. Instead:
   adds a map).
 - **scratch** (no project): there is no guide, so write the whole prompt, including the art style in words unless
   attached references carry it.
-- **pose guide** for action, combat or acrobatic poses (jumps, flips, slides, landings, sword strikes, crouches,
-  anything with crossed or foreshortened limbs). Use it also when the request asks for one or names a guide pose
-  entry. Steps:
+- **pose guide** for EVERY image with a character, calm or action, unless the request says the session speed is
+  `fastest`. The server refuses a character request without one (`POSE_REQUIRED`). Pass `pose="none"` only
+  when one mannequin can't pose the image: several characters, a face close-up, or Blender not set up. Say
+  which in your note. Never lower the speed yourself; only the user does, through the main conversation.
+  Steps:
   1. Call `render_pose` (read-only for the guide). Start from the closest preset and override joints
      (`{"preset": "land", "right_arm": {...}}`). Settings:
      - `heads`: the character's proportions from their guide entry (e.g. "about 7 heads"), default 7.
@@ -92,16 +103,21 @@ not draw a new image. Instead:
 
      `color_sides=True` tints the figure's left blue and right warm, to check sides; don't use that render for
      generation. Fix and render again, at most 3 tries.
-  3. Pass the final mannequin path as `generate_image(pose=<path>)`, with the character entries as usual. The
-     server sends the mannequin as the pose and crops full-length character/style references to head and chest,
-     so they don't override the pose.
-     Only when the request asks for depth mode (or the pose must match a silhouette exactly and no props
-     matter): render with `depth=True` and pass `pose_mode="depth"`. It uses the depth LoRA and leaves the
-     style reference out; props such as swords come out weaker than in the default mode.
+  3. Pass the final mannequin path as `generate_image(pose=<path>)`, with the character entries as usual, and
+     leave `pose_mode` unset: the session speed chooses it.
+     - At speed `full` (the default), `render_pose` writes the depth map and `generate_image` uses the depth
+       model. Image 1 is the depth map and the character's full reference follows; the style reference is left
+       out (its description stays). Props such as swords can come out weaker: check that the blade is one
+       straight, unbroken piece. If every candidate breaks it, say so in your note; don't switch modes on
+       your own.
+     - At speed `fast`, the mannequin is sent as a plain pose reference, and full-length character and style
+       references are cropped to head and chest so they don't override the pose.
   4. In the prompt, describe the action in words too, and keep the mannequin out of it (don't write "mannequin"
      or "grey"). Judge anatomy against the mannequin.
-  5. If `render_pose` says Blender isn't set up, generate without a pose guide and add `pose renderer not set up
+  5. If `render_pose` says Blender isn't set up, generate with `pose="none"` and add `pose renderer not set up
      (setup_blender)` to your note.
+  6. In your note, say which pose mode the server reported (`mannequin + depth model`, `mannequin guide` or
+     `none`).
 - If the `generate_image` MCP tool of the local-imagen plugin is available (its name ends in
   `imagen__generate_image`), call it with the default candidate count. Its result contains every candidate preview
   plus a **checklist**.
